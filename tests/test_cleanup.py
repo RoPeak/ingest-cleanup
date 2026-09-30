@@ -113,6 +113,7 @@ def test_music_partial_or_cancelled_is_not_proof(tmp_path: Path, field: str, val
     (state / "reports" / "music.json").write_text(json.dumps(data))
     category = Category("Music", ingest, production, "music"); items, bad = assess_category(Config((category,), (), state, False), category)
     assert items[0].state == "UNKNOWN" and bad
+<<<<<<< HEAD
 
 
 def test_audit_report_is_written_under_xdg_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -129,3 +130,5 @@ def test_apply_requires_exact_typed_confirmation(tmp_path: Path, monkeypatch: py
     monkeypatch.setattr(cli, "_load", lambda path: config)
     monkeypatch.setattr("builtins.input", lambda prompt: "delete verified sources")
     assert cli.main(["apply"]) == 0 and source.exists()
+=======
+>>>>>>> 752535dbcaecb0f276dbee5c50c03dc4c3e4e64b
