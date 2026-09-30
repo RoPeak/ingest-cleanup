@@ -1,0 +1,29 @@
+[categories.movies]
+ingest_root = "/srv/data/ingest/movies"
+production_root = "/srv/data/media/Movies"
+adapter = "video"
+
+[categories.tv]
+ingest_root = "/srv/data/ingest/tv"
+production_root = "/srv/data/media/TV Shows"
+adapter = "video"
+
+[categories.music]
+ingest_root = "/srv/data/ingest/music"
+production_root = "/srv/data/media/Music"
+adapter = "music"
+
+[categories.books]
+ingest_root = "/srv/data/ingest/books"
+production_root = "/srv/data/media/Kavita/Books"
+adapter = "kavita"
+
+[categories.comics]
+ingest_root = "/srv/data/ingest/comics"
+production_root = "/srv/data/media/Kavita/Comics"
+adapter = "kavita"
+
+[state]
+video_roots = ["/home/ronan/.local/state/video-ingest"]
+music_root = "/home/ronan/.local/state/music-ingest"
+kavita_enabled = false
