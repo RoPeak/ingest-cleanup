@@ -24,6 +24,6 @@ production_root = "/srv/data/media/Kavita/Comics"
 adapter = "kavita"
 
 [state]
-video_roots = ["/home/ronan/.local/state/video-ingest"]
-music_root = "/home/ronan/.local/state/music-ingest"
+video_roots = ["/home/user/.local/state/video-ingest"]
+music_root = "/home/user/.local/state/music-ingest"
 kavita_enabled = false
