@@ -28,6 +28,7 @@ class Config:
     video_state_roots: tuple[Path, ...]
     music_state_root: Path | None
     kavita_enabled: bool
+    kavita_state_root: Path | None = None
 
 
 def _path(value: object, label: str) -> Path:
@@ -61,10 +62,11 @@ def load(path: Path | None = None) -> Config:
     if not isinstance(video, list):
         raise ValueError("state.video_roots must be an array")
     music = state.get("music_root")
+    kavita_root = state.get("kavita_root")
     kavita = state.get("kavita_enabled", False)
     if not isinstance(kavita, bool):
         raise ValueError("state.kavita_enabled must be boolean")
-    return Config(tuple(categories), tuple(_path(v, "state.video_roots item") for v in video), _path(music, "state.music_root") if music is not None else None, kavita)
+    return Config(tuple(categories), tuple(_path(v, "state.video_roots item") for v in video), _path(music, "state.music_root") if music is not None else None, kavita, _path(kavita_root, "state.kavita_root") if kavita_root is not None else None)
 
 
 def validate(config: Config) -> None:

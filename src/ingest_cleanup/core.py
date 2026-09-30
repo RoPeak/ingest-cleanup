@@ -104,14 +104,18 @@ def assess_category(config: Config, category: Category, progress: Callable[[Path
             if destination_id.links != 1: raise ValueError("destination has hardlink count other than one")
         except (OSError, ValueError):
             results.append(Assessment(category.name, source, evidence.destination, "REVIEW", "published destination missing or unsafe", evidence, source_id.size, source_id)); continue
-        if source_id.size != destination_id.size:
+        if not evidence.transformed and source_id.size != destination_id.size:
             results.append(Assessment(category.name, source, evidence.destination, "REVIEW", "size mismatch", evidence, source_id.size, source_id)); continue
         if not hash_files:
             results.append(Assessment(category.name, source, evidence.destination, "CANDIDATE", "provenance and size checks passed; hash verification required", evidence, source_id.size, source_id)); continue
         try:
             source_hash, source_id = _hash(source, progress)
             destination_hash, _ = _hash(evidence.destination, progress)
-            if source_hash != destination_hash:
+            if evidence.source_sha256 and source_hash != evidence.source_sha256:
+                results.append(Assessment(category.name, source, evidence.destination, "REVIEW", "source differs from recorded publication input", evidence, source_id.size, source_id)); continue
+            if evidence.destination_sha256 and destination_hash != evidence.destination_sha256:
+                results.append(Assessment(category.name, source, evidence.destination, "REVIEW", "destination differs from recorded publication output", evidence, source_id.size, source_id)); continue
+            if not evidence.transformed and source_hash != destination_hash:
                 results.append(Assessment(category.name, source, evidence.destination, "REVIEW", "content mismatch", evidence, source_id.size, source_id)); continue
             results.append(Assessment(category.name, source, evidence.destination, "SAFE", "production copy verified", evidence, source_id.size, source_id, source_hash))
         except (OSError, ValueError) as exc:

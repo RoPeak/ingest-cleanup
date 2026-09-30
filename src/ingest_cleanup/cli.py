@@ -34,11 +34,15 @@ def _progress(verbose: bool):
     return callback
 
 
-def _print(results: list[Assessment], rejected: list[object], verbose: bool) -> None:
+def _print(results: list[Assessment], rejected: list[object], verbose: bool, categories=None) -> None:
     print("Ingest Cleanup\n\nScanning successful ingestion records...\n")
     grouped: dict[str, list[Assessment]] = defaultdict(list)
     for result in results: grouped[result.category].append(result)
-    for category, values in grouped.items():
+    # Show every configured category: an empty Books root must not look like an
+    # unsupported category.
+    names = [item.name for item in categories] if categories is not None else list(grouped)
+    for category in names:
+        values = grouped.get(category, [])
         counts = Counter(value.state for value in values)
         print(category)
         print(f"  Incoming files: {len(values)}")
@@ -84,10 +88,10 @@ def main(argv: list[str] | None = None) -> int:
         print("Status checks provenance, existence, and size only. It never declares sources deletion-ready.\n")
     results, rejected = assess(config, _progress(args.verbose) if hash_files else None, hash_files=hash_files)
     if args.command != "apply":
-        _print(results, rejected, args.verbose); return 0
+        _print(results, rejected, args.verbose, config.categories); return 0
     safe = [item for item in results if item.state == "SAFE"]
     total = sum(item.size for item in safe)
-    _print(results, rejected, args.verbose)
+    _print(results, rejected, args.verbose, config.categories)
     print(f"\nProposed deletions: {len(safe)} file(s), {total} bytes")
     if not safe: return 0
     try: answer = input("Type DELETE VERIFIED SOURCES to delete these files: ").strip()

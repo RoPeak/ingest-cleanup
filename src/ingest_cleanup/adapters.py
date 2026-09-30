@@ -15,6 +15,9 @@ class Evidence:
     adapter: str
     report: Path
     report_id: str
+    source_sha256: str | None = None
+    destination_sha256: str | None = None
+    transformed: bool = False
 
 
 @dataclass(frozen=True)
@@ -109,7 +112,38 @@ def music_records(config: Config, category: Category) -> tuple[list[Evidence], l
     return records, rejected
 
 
+def kavita_records(config: Config, category: Category) -> tuple[list[Evidence], list[RejectedReport]]:
+    """Read only completed preserve-source records; old reports are never inferred."""
+    records: list[Evidence] = []; rejected: list[RejectedReport] = []
+    if not config.kavita_enabled:
+        return records, rejected
+    # The report directory is intentionally explicit/configured through the
+    # existing state root convention, not discovered from arbitrary media dirs.
+    root = config.kavita_state_root
+    if root is None or not root.is_dir() or root.is_symlink():
+        return records, rejected
+    for report in root.glob("kavita-reports/*.json"):
+        try:
+            if not _safe_report_file(report, root): raise ValueError("unsafe report path")
+            data = json.loads(report.read_text(encoding="utf-8"))
+            if not isinstance(data, dict) or data.get("report_schema") != "kavita-ingest-publication-v1":
+                raise ValueError("unsupported Kavita publication schema")
+            if not (data.get("status") == "completed" and data.get("approved_apply") is True and data.get("source_lifecycle") == "preserved" and data.get("verification_completed") is True and not data.get("recovery_required")):
+                raise ValueError("not a completed verified preserve-source APPLY")
+            for index, item in enumerate(data.get("items", []), 1):
+                if not isinstance(item, dict): raise ValueError("invalid item")
+                source, destination = _absolute_clean(item.get("source")), _absolute_clean(item.get("destination"))
+                sh, dh = item.get("source_sha256"), item.get("destination_sha256")
+                if source is None or destination is None or not all(isinstance(x, str) and len(x) == 64 for x in (sh, dh)):
+                    raise ValueError("item lacks safe paths or hashes")
+                records.append(Evidence(source, destination, "kavita", report, f"{report}:{index}", sh, dh, bool(item.get("transformations"))))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+            rejected.append(RejectedReport(report, str(exc)))
+    return records, rejected
+
+
 def collect(config: Config, category: Category) -> tuple[list[Evidence], list[RejectedReport]]:
     if category.adapter == "video": return video_records(config, category)
     if category.adapter == "music": return music_records(config, category)
+    if category.adapter == "kavita": return kavita_records(config, category)
     return [], []
