@@ -21,16 +21,28 @@ def parser() -> argparse.ArgumentParser:
 def _progress(verbose: bool):
     seen: dict[Path, int] = {}
     started: dict[Path, float] = {}
+    tty = sys.stdout.isatty()
+    order: list[Path] = []
     def callback(path: Path, complete: int, total: int) -> None:
         if total == 0: return
         percent = complete * 100 // total
         if path not in started:
             started[path] = time.monotonic()
-            print(f"  Hashing {path.name} ({total / 1024 / 1024:.1f} MiB)", flush=True)
+            order.append(path)
+            if not tty:
+                print(f"  Verifying {path.name} ({total / 1024 / 1024:.1f} MiB)", flush=True)
         if seen.get(path) != percent and (percent == 100 or percent % 10 == 0):
-            seen[path] = percent; print(f"  hashing {path.name}: {percent}%")
+            seen[path] = percent
             elapsed = max(time.monotonic() - started[path], 0.001)
-            print(f"    {complete / 1024 / 1024:.1f} MiB read | {complete / elapsed / 1024 / 1024:.1f} MiB/s", flush=True)
+            rate = complete / elapsed / 1024 / 1024
+            role = "Source" if len(order) % 2 else "Destination"
+            suffix = f" | {rate:.1f} MiB/s" if complete >= 32 * 1024 * 1024 and elapsed >= 1 else ""
+            if tty:
+                print(f"\r\033[2KVerifying {path.name} | {role} {percent}%{suffix}", end="", flush=True)
+                if percent == 100:
+                    print()
+            else:
+                print(f"  {role.lower()} {path.name}: {percent}%{suffix}", flush=True)
     return callback
 
 
