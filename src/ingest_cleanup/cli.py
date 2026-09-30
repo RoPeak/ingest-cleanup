@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -13,17 +14,23 @@ def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(prog="ingest-cleanup", description="Safely remove preserved ingest files only after fresh provenance verification.")
     value.add_argument("--config-file", type=Path, default=xdg_config())
     value.add_argument("--verbose", action="store_true")
-    value.add_argument("command", nargs="?", choices=("status", "verify", "apply", "config"), default="status")
+    value.add_argument("command", nargs="?", choices=("status", "verify", "apply", "config", "help"), default="status")
     return value
 
 
 def _progress(verbose: bool):
     seen: dict[Path, int] = {}
+    started: dict[Path, float] = {}
     def callback(path: Path, complete: int, total: int) -> None:
-        if not verbose or total == 0: return
+        if total == 0: return
         percent = complete * 100 // total
+        if path not in started:
+            started[path] = time.monotonic()
+            print(f"  Hashing {path.name} ({total / 1024 / 1024:.1f} MiB)", flush=True)
         if seen.get(path) != percent and (percent == 100 or percent % 10 == 0):
             seen[path] = percent; print(f"  hashing {path.name}: {percent}%")
+            elapsed = max(time.monotonic() - started[path], 0.001)
+            print(f"    {complete / 1024 / 1024:.1f} MiB read | {complete / elapsed / 1024 / 1024:.1f} MiB/s", flush=True)
     return callback
 
 
@@ -35,6 +42,7 @@ def _print(results: list[Assessment], rejected: list[object], verbose: bool) -> 
         counts = Counter(value.state for value in values)
         print(category)
         print(f"  Incoming files: {len(values)}")
+        print(f"  Candidate:      {counts['CANDIDATE']}")
         print(f"  Safe:           {counts['SAFE']}")
         print(f"  Review:         {counts['REVIEW']}")
         print(f"  Unknown:        {counts['UNKNOWN']}")
@@ -61,13 +69,20 @@ def main(argv: list[str] | None = None) -> int:
         config = _load(args.config_file)
     except (OSError, ValueError) as exc:
         print(f"ingest-cleanup: configuration error: {exc}", file=sys.stderr); return 2
+    if args.command == "help":
+        parser().print_help(); return 0
     if args.command == "config":
         print(f"Config: {args.config_file}")
         for value in config.categories:
             print(f"{value.name}: {value.ingest_root} -> {value.production_root} ({value.adapter})")
         print(f"Kavita adapter enabled: {config.kavita_enabled}")
         return 0
-    results, rejected = assess(config, _progress(args.verbose))
+    hash_files = args.command != "status"
+    if hash_files:
+        print("Full verification recomputes SHA-256 for source and production copies. Large libraries can take several minutes. No files will be changed.\n")
+    else:
+        print("Status checks provenance, existence, and size only. It never declares sources deletion-ready.\n")
+    results, rejected = assess(config, _progress(args.verbose) if hash_files else None, hash_files=hash_files)
     if args.command != "apply":
         _print(results, rejected, args.verbose); return 0
     safe = [item for item in results if item.state == "SAFE"]

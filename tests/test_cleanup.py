@@ -97,7 +97,7 @@ def test_music_apply_chain_and_dry_run(tmp_path: Path):
     ingest = tmp_path / "ingest"; production = tmp_path / "production"; state = tmp_path / "state"; ingest.mkdir(); production.mkdir(); (state / "reports").mkdir(parents=True)
     source = ingest / "album" / "track.mp3"; source.parent.mkdir(); source.write_bytes(b"music")
     destination = production / "artist" / "track.mp3"; destination.parent.mkdir(); destination.write_bytes(b"music")
-    data = {"mode":"apply","approved_to_publish":True,"source_lifecycle":"preserved","source_root":str(ingest),"copied_tracks":1,"published_file_count":1,"existing_or_conflicting_file_count":0,"albums":[{"tracks":[{"source":"album/track.mp3","destination":"artist/track.mp3","readable":True,"verified_size_match":True}]}]}
+    data = music_report(ingest, production, "album/track.mp3", "artist/track.mp3")
     (state / "reports" / "music.json").write_text(json.dumps(data))
     category = Category("Music", ingest, production, "music"); config = Config((category,), (), state, False)
     items, bad = assess_category(config, category); assert not bad and items[0].state == "SAFE"
@@ -105,17 +105,32 @@ def test_music_apply_chain_and_dry_run(tmp_path: Path):
     items, bad = assess_category(config, category); assert items[0].state == "UNKNOWN" and bad
 
 
-@pytest.mark.parametrize("field,value", [("published_file_count", 0), ("existing_or_conflicting_file_count", 1), ("approved_to_publish", False)])
+def music_report(ingest: Path, production: Path, source: str, destination: str) -> dict[str, object]:
+    return {"report_schema":"music-ingest-publication-v1", "mode":"apply", "approved_to_publish":True, "publication":"copy", "source_lifecycle":"preserved", "publication_completed":True, "source_root":str(ingest), "library_root":str(production), "copied_tracks":1, "published_file_count":2, "albums":[{"tracks":[{"source":source, "source_path":str(ingest / source), "destination":destination, "destination_path":str(production / destination), "final_destination":str(production / destination), "readable":True, "source_size_bytes":5, "staged_size_bytes":5, "verified_size_match":True, "publication_status":"published_or_verified_existing"}]}]}
+
+
+@pytest.mark.parametrize("field,value", [("report_schema", "wrong"), ("publication_completed", False), ("approved_to_publish", False), ("mode", "dry-run")])
 def test_music_partial_or_cancelled_is_not_proof(tmp_path: Path, field: str, value: object):
     ingest = tmp_path / "ingest"; production = tmp_path / "production"; state = tmp_path / "state"; ingest.mkdir(); production.mkdir(); (state / "reports").mkdir(parents=True)
     source = ingest / "s"; destination = production / "d"; source.write_bytes(b"x"); destination.write_bytes(b"x")
-    data = {"mode":"apply","approved_to_publish":True,"source_lifecycle":"preserved","source_root":str(ingest),"copied_tracks":1,"published_file_count":1,"existing_or_conflicting_file_count":0,"albums":[{"tracks":[{"source":"s","destination":"d","readable":True,"verified_size_match":True}]}]}; data[field] = value
+    data = music_report(ingest, production, "s", "d"); data[field] = value
     (state / "reports" / "music.json").write_text(json.dumps(data))
     category = Category("Music", ingest, production, "music"); items, bad = assess_category(Config((category,), (), state, False), category)
     assert items[0].state == "UNKNOWN" and bad
-<<<<<<< HEAD
 
 
+def test_music_auxiliary_files_do_not_poison_audio_provenance(tmp_path: Path):
+    ingest = tmp_path / "ingest"; production = tmp_path / "production"; state = tmp_path / "state"; ingest.mkdir(); production.mkdir(); (state / "reports").mkdir(parents=True)
+    for index in range(92):
+        source = ingest / f"source-{index}.mp3"; destination = production / f"track-{index}.mp3"; source.write_bytes(b"music"); destination.write_bytes(b"music")
+        data = music_report(ingest, production, source.name, destination.name) if index == 0 else data
+        if index:
+            data["albums"][0]["tracks"].append({"source":source.name, "source_path":str(source), "destination":destination.name, "destination_path":str(destination), "final_destination":str(destination), "readable":True, "source_size_bytes":5, "staged_size_bytes":5, "verified_size_match":True, "publication_status":"published_or_verified_existing"})
+    data["published_file_count"] = 96
+    (state / "reports" / "music.json").write_text(json.dumps(data))
+    category = Category("Music", ingest, production, "music")
+    items, bad = assess_category(Config((category,), (), state, False), category)
+    assert not bad and len(items) == 92 and {item.state for item in items} == {"SAFE"}
 def test_audit_report_is_written_under_xdg_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
     audit = write_audit({"items": [], "directories_pruned": []})
@@ -130,5 +145,3 @@ def test_apply_requires_exact_typed_confirmation(tmp_path: Path, monkeypatch: py
     monkeypatch.setattr(cli, "_load", lambda path: config)
     monkeypatch.setattr("builtins.input", lambda prompt: "delete verified sources")
     assert cli.main(["apply"]) == 0 and source.exists()
-=======
->>>>>>> 752535dbcaecb0f276dbee5c50c03dc4c3e4e64b

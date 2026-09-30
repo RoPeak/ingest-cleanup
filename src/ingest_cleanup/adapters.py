@@ -79,22 +79,31 @@ def music_records(config: Config, category: Category) -> tuple[list[Evidence], l
         try:
             data = json.loads(report.read_text(encoding="utf-8"))
             if not isinstance(data, dict): raise ValueError("report is not an object")
-            if not (data.get("mode") == "apply" and data.get("approved_to_publish") is True and data.get("source_lifecycle") == "preserved"):
+            if data.get("report_schema") != "music-ingest-publication-v1":
+                raise ValueError("unsupported music publication schema")
+            if not (data.get("mode") == "apply" and data.get("approved_to_publish") is True
+                    and data.get("publication") == "copy" and data.get("source_lifecycle") == "preserved"):
                 raise ValueError("not an approved preserved APPLY publication")
-            copied, published, conflicts = data.get("copied_tracks"), data.get("published_file_count"), data.get("existing_or_conflicting_file_count")
-            if not all(isinstance(v, int) for v in (copied, published, conflicts)) or copied != published or conflicts != 0:
-                raise ValueError("report does not prove every staged track was published")
+            if data.get("publication_completed") is not True:
+                raise ValueError("publication did not complete")
             source_root = _absolute_clean(data.get("source_root"))
-            if source_root is None: raise ValueError("unsafe source root")
+            library_root = _absolute_clean(data.get("library_root"))
+            if source_root is None or library_root is None or source_root != category.ingest_root or library_root != category.production_root:
+                raise ValueError("report roots do not match configured roots")
             tracks = [track for album in data.get("albums", []) if isinstance(album, dict) for track in album.get("tracks", []) if isinstance(track, dict)]
-            if len(tracks) != copied: raise ValueError("track count does not match publication count")
             for index, track in enumerate(tracks, 1):
                 src, rel = track.get("source"), track.get("destination")
+                source_path, final_destination = _absolute_clean(track.get("source_path")), _absolute_clean(track.get("final_destination"))
                 if not isinstance(src, str) or not isinstance(rel, str) or Path(src).is_absolute() or Path(rel).is_absolute() or ".." in Path(src).parts or ".." in Path(rel).parts:
                     raise ValueError("unsafe track path")
-                if track.get("readable") is not True or track.get("verified_size_match") is not True:
-                    raise ValueError("track staging verification failed")
-                records.append(Evidence(source_root / src, category.production_root / rel, "music", report, f"{report}:{index}"))
+                if source_path != source_root / src or final_destination != library_root / rel or _absolute_clean(track.get("destination_path")) != final_destination:
+                    raise ValueError("track paths are inconsistent")
+                if (track.get("readable") is not True or track.get("verified_size_match") is not True
+                        or not isinstance(track.get("source_size_bytes"), int)
+                        or track.get("source_size_bytes") != track.get("staged_size_bytes")
+                        or track.get("publication_status") != "published_or_verified_existing"):
+                    raise ValueError("track does not prove successful publication")
+                records.append(Evidence(source_path, final_destination, "music", report, f"{report}:{index}"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
             rejected.append(RejectedReport(report, str(exc)))
     return records, rejected

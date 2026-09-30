@@ -74,7 +74,7 @@ def _files(root: Path):
             if not candidate.is_symlink(): yield candidate
 
 
-def assess_category(config: Config, category: Category, progress: Callable[[Path, int, int], None] | None = None) -> tuple[list[Assessment], list[RejectedReport]]:
+def assess_category(config: Config, category: Category, progress: Callable[[Path, int, int], None] | None = None, *, hash_files: bool = True) -> tuple[list[Assessment], list[RejectedReport]]:
     records, rejected = collect(config, category)
     by_source: dict[Path, list[Evidence]] = {}
     by_destination: dict[Path, list[Evidence]] = {}
@@ -106,6 +106,8 @@ def assess_category(config: Config, category: Category, progress: Callable[[Path
             results.append(Assessment(category.name, source, evidence.destination, "REVIEW", "published destination missing or unsafe", evidence, source_id.size, source_id)); continue
         if source_id.size != destination_id.size:
             results.append(Assessment(category.name, source, evidence.destination, "REVIEW", "size mismatch", evidence, source_id.size, source_id)); continue
+        if not hash_files:
+            results.append(Assessment(category.name, source, evidence.destination, "CANDIDATE", "provenance and size checks passed; hash verification required", evidence, source_id.size, source_id)); continue
         try:
             source_hash, source_id = _hash(source, progress)
             destination_hash, _ = _hash(evidence.destination, progress)
@@ -117,10 +119,10 @@ def assess_category(config: Config, category: Category, progress: Callable[[Path
     return results, rejected
 
 
-def assess(config: Config, progress: Callable[[Path, int, int], None] | None = None) -> tuple[list[Assessment], list[RejectedReport]]:
+def assess(config: Config, progress: Callable[[Path, int, int], None] | None = None, *, hash_files: bool = True) -> tuple[list[Assessment], list[RejectedReport]]:
     outcomes: list[Assessment] = []; rejected: list[RejectedReport] = []
     for category in config.categories:
-        outcome, bad = assess_category(config, category, progress)
+        outcome, bad = assess_category(config, category, progress, hash_files=hash_files)
         outcomes.extend(outcome); rejected.extend(bad)
     return outcomes, rejected
 
