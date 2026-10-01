@@ -7,14 +7,15 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from .config import Config, load, validate, xdg_config
-from .core import Assessment, apply_deletions, assess, write_audit
+from .core import Assessment, apply_deletions, assess, assess_category, write_audit
 
 
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(prog="ingest-cleanup", description="Safely remove preserved ingest files only after fresh provenance verification.")
     value.add_argument("--config-file", type=Path, default=xdg_config())
     value.add_argument("--verbose", action="store_true")
-    value.add_argument("command", nargs="?", choices=("status", "verify", "apply", "config", "help"), default="status")
+    value.add_argument("command", nargs="?", choices=("status", "verify", "apply", "config", "help", "explain", "provenance-status"), default="status")
+    value.add_argument("path", nargs="?", type=Path, help="Incoming source path for explain")
     return value
 
 
@@ -79,6 +80,53 @@ def _load(path: Path) -> Config:
     config = load(path); validate(config); return config
 
 
+def _provenance_status(config: Config) -> None:
+    print("Publication provenance adapters\n")
+    for category in config.categories:
+        if category.adapter == "disabled":
+            state = "disabled"
+        elif category.adapter == "kavita":
+            state = "ready" if config.kavita_enabled and config.kavita_state_root else "not configured"
+        elif category.adapter == "video":
+            state = "ready" if config.video_state_roots else "not configured"
+        elif category.adapter == "music":
+            state = "ready" if config.music_state_root else "not configured"
+        else:
+            state = "unsupported"
+        print(f"{category.name:<16} {category.adapter:<8} {state}")
+    print("\nThis checks adapter configuration only; it does not assess any source as safe.")
+
+
+def _explain(config: Config, path: Path) -> int:
+    candidate = path.expanduser()
+    for category in config.categories:
+        try:
+            candidate.resolve(strict=False).relative_to(category.ingest_root.resolve(strict=True))
+        except (OSError, ValueError):
+            continue
+        results, rejected = assess_category(config, category, hash_files=False)
+        item = next((value for value in results if value.source == candidate), None)
+        if item is None:
+            print("UNKNOWN\nSource is not a regular supported Incoming file.")
+            return 0
+        reason = item.reason
+        if item.state == "UNKNOWN" and reason == "insufficient proof":
+            reason = "No matching accepted publication report exists."
+            if rejected:
+                reason += f" {len(rejected)} report(s) were rejected as incomplete, malformed, or unsafe."
+        print(item.state)
+        print(f"Category: {item.category}")
+        print(f"Reason: {reason}")
+        if item.evidence:
+            print(f"Adapter: {item.evidence.adapter}")
+            print(f"Report: {item.evidence.report}")
+            print(f"Record: {item.evidence.report_id}")
+            print(f"Destination: {item.evidence.destination}")
+        return 0
+    print("UNKNOWN\nPath is outside configured Incoming roots.")
+    return 2
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
@@ -93,6 +141,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{value.name}: {value.ingest_root} -> {value.production_root} ({value.adapter})")
         print(f"Kavita adapter enabled: {config.kavita_enabled}")
         return 0
+    if args.command == "provenance-status":
+        _provenance_status(config); return 0
+    if args.command == "explain":
+        if args.path is None:
+            print("ingest-cleanup explain requires an Incoming source path", file=sys.stderr); return 2
+        return _explain(config, args.path)
     hash_files = args.command != "status"
     if hash_files:
         print("Full verification recomputes SHA-256 for source and production copies. Large libraries can take several minutes. No files will be changed.\n")

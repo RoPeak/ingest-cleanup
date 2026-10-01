@@ -138,6 +138,18 @@ def test_audit_report_is_written_under_xdg_state(tmp_path: Path, monkeypatch: py
     assert json.loads(audit.read_text())["items"] == []
 
 
+def test_explain_and_provenance_status_are_read_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
+    ingest, production, state, category, config = setup(tmp_path)
+    source = ingest / "unknown.mkv"; source.write_bytes(b"x")
+    monkeypatch.setattr(cli, "_load", lambda path: config)
+    assert cli.main(["explain", str(source)]) == 0
+    output = capsys.readouterr().out
+    assert "UNKNOWN" in output and "No matching accepted publication report exists." in output
+    assert cli.main(["provenance-status"]) == 0
+    assert "TV" in capsys.readouterr().out
+    assert source.exists() and not list(production.iterdir())
+
+
 def test_apply_requires_exact_typed_confirmation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     ingest, production, state, category, config = setup(tmp_path)
     source = ingest / "source"; destination = production / "dest"; source.write_bytes(b"x"); destination.write_bytes(b"x")
