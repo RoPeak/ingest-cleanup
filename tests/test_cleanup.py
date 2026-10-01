@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
 import pytest
 
-from ingest_cleanup.config import Category, Config, validate
+from ingest_cleanup.config import Category, Config, kavita_xdg_state, validate
 from ingest_cleanup.core import apply_deletions, assess_category, write_audit
 from ingest_cleanup import cli
 
@@ -148,6 +149,76 @@ def test_explain_and_provenance_status_are_read_only(tmp_path: Path, monkeypatch
     assert cli.main(["provenance-status"]) == 0
     assert "TV" in capsys.readouterr().out
     assert source.exists() and not list(production.iterdir())
+
+
+def _kavita_report(source: Path, destination: Path, *, transformed: bool = False) -> dict[str, object]:
+    return {
+        "report_schema": "kavita-ingest-publication-v1",
+        "operation_id": "synthetic-preserve-run",
+        "approved_apply": True,
+        "status": "completed",
+        "source_lifecycle": "preserved",
+        "verification_completed": True,
+        "recovery_required": False,
+        "items": [{
+            "source": str(source),
+            "destination": str(destination),
+            "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            "destination_sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
+            "transformations": ["cbr-to-cbz"] if transformed else [],
+        }],
+    }
+
+
+@pytest.mark.parametrize(
+    "suffix,transformed", [(".cbz", False), (".cbr", True), (".epub", False), (".pdf", False)]
+)
+def test_kavita_publication_reports_are_discovered_and_fail_closed(
+    tmp_path: Path, suffix: str, transformed: bool, capsys: pytest.CaptureFixture[str]
+):
+    ingest = tmp_path / "incoming"
+    production = tmp_path / "library"
+    state = tmp_path / "kavita-state"
+    ingest.mkdir()
+    production.mkdir()
+    (state / "kavita-reports").mkdir(parents=True)
+    source = ingest / f"source{suffix}"
+    destination = production / f"published{'.cbz' if transformed else suffix}"
+    source.write_bytes(b"original")
+    destination.write_bytes(b"published" if transformed else b"original")
+    (state / "kavita-reports" / "run.json").write_text(
+        json.dumps(_kavita_report(source, destination, transformed=transformed))
+    )
+    category = Category("Books" if suffix in {".epub", ".pdf"} else "Comics", ingest, production, "kavita")
+    config = Config((category,), (), None, True, state)
+    cli._provenance_status(config)
+    assert "kavita   ready" in capsys.readouterr().out
+    candidate, rejected = assess_category(config, category, hash_files=False)
+    assert not rejected and candidate[0].state == "CANDIDATE"
+    verified, rejected = assess_category(config, category, hash_files=True)
+    assert not rejected and verified[0].state == "SAFE"
+    source.write_bytes(b"changed source")
+    assert assess_category(config, category)[0][0].state == "REVIEW"
+    source.write_bytes(b"original")
+    destination.write_bytes(b"changed destination")
+    assert assess_category(config, category)[0][0].state == "REVIEW"
+
+
+def test_kavita_default_state_root_uses_xdg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    assert kavita_xdg_state() == tmp_path / "kavita-ingest"
+
+
+def test_apply_empty_result_uses_mode_aware_completion_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    ingest, production, state, category, config = setup(tmp_path)
+    (ingest / "unknown.mkv").write_bytes(b"x")
+    monkeypatch.setattr(cli, "_load", lambda path: config)
+    assert cli.main(["apply"]) == 0
+    output = capsys.readouterr().out
+    assert "Verification complete. No deletion-ready sources were found." in output
+    assert "Run `ingest-cleanup apply`" not in output
 
 
 def test_apply_requires_exact_typed_confirmation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

@@ -14,6 +14,16 @@ def xdg_state() -> Path:
     return Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "ingest-cleanup"
 
 
+def kavita_xdg_state() -> Path:
+    """The producer's default state root, following its XDG contract.
+
+    A Kavita category is itself the opt-in for this adapter.  The report root
+    may still be overridden for a producer configured with a non-default
+    database path, but it must never be guessed from a media directory.
+    """
+    return Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "kavita-ingest"
+
+
 @dataclass(frozen=True)
 class Category:
     name: str
@@ -63,10 +73,19 @@ def load(path: Path | None = None) -> Config:
         raise ValueError("state.video_roots must be an array")
     music = state.get("music_root")
     kavita_root = state.get("kavita_root")
-    kavita = state.get("kavita_enabled", False)
-    if not isinstance(kavita, bool):
+    legacy_kavita = state.get("kavita_enabled")
+    if legacy_kavita is not None and not isinstance(legacy_kavita, bool):
         raise ValueError("state.kavita_enabled must be boolean")
-    return Config(tuple(categories), tuple(_path(v, "state.video_roots item") for v in video), _path(music, "state.music_root") if music is not None else None, kavita, _path(kavita_root, "state.kavita_root") if kavita_root is not None else None)
+    # `kavita_enabled` was an obsolete second opt-in which caused the consumer
+    # to disagree with a configured Kavita producer.  Keep accepting it so old
+    # config files load, but category.adapter is now the sole opt-in.
+    return Config(
+        tuple(categories),
+        tuple(_path(v, "state.video_roots item") for v in video),
+        _path(music, "state.music_root") if music is not None else None,
+        True,
+        _path(kavita_root, "state.kavita_root") if kavita_root is not None else kavita_xdg_state(),
+    )
 
 
 def validate(config: Config) -> None:

@@ -47,7 +47,14 @@ def _progress(verbose: bool):
     return callback
 
 
-def _print(results: list[Assessment], rejected: list[object], verbose: bool, categories=None) -> None:
+def _print(
+    results: list[Assessment],
+    rejected: list[object],
+    verbose: bool,
+    categories=None,
+    *,
+    apply_mode: bool = False,
+) -> None:
     print("Ingest Cleanup\n\nScanning successful ingestion records...\n")
     grouped: dict[str, list[Assessment]] = defaultdict(list)
     for result in results: grouped[result.category].append(result)
@@ -73,7 +80,8 @@ def _print(results: list[Assessment], rejected: list[object], verbose: bool, cat
         print()
     if rejected and verbose:
         print(f"Ignored corrupt/unsafe reports: {len(rejected)}")
-    print("No files were deleted. Run `ingest-cleanup apply` to review deletion.")
+    if not apply_mode:
+        print("No files were deleted. Run `ingest-cleanup apply` to verify and review deletion.")
 
 
 def _load(path: Path) -> Config:
@@ -86,7 +94,8 @@ def _provenance_status(config: Config) -> None:
         if category.adapter == "disabled":
             state = "disabled"
         elif category.adapter == "kavita":
-            state = "ready" if config.kavita_enabled and config.kavita_state_root else "not configured"
+            root = config.kavita_state_root
+            state = "ready" if root and root.is_dir() and not root.is_symlink() else "not configured"
         elif category.adapter == "video":
             state = "ready" if config.video_state_roots else "not configured"
         elif category.adapter == "music":
@@ -139,7 +148,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Config: {args.config_file}")
         for value in config.categories:
             print(f"{value.name}: {value.ingest_root} -> {value.production_root} ({value.adapter})")
-        print(f"Kavita adapter enabled: {config.kavita_enabled}")
+        print(f"Kavita report root: {config.kavita_state_root}")
         return 0
     if args.command == "provenance-status":
         _provenance_status(config); return 0
@@ -157,9 +166,11 @@ def main(argv: list[str] | None = None) -> int:
         _print(results, rejected, args.verbose, config.categories); return 0
     safe = [item for item in results if item.state == "SAFE"]
     total = sum(item.size for item in safe)
-    _print(results, rejected, args.verbose, config.categories)
+    _print(results, rejected, args.verbose, config.categories, apply_mode=True)
     print(f"\nProposed deletions: {len(safe)} file(s), {total} bytes")
-    if not safe: return 0
+    if not safe:
+        print("Verification complete. No deletion-ready sources were found.")
+        return 0
     try: answer = input("Type DELETE VERIFIED SOURCES to delete these files: ").strip()
     except (EOFError, KeyboardInterrupt): answer = ""
     if answer != "DELETE VERIFIED SOURCES":

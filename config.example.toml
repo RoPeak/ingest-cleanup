@@ -26,5 +26,7 @@ adapter = "kavita"
 [state]
 video_roots = ["/home/user/.local/state/video-ingest"]
 music_root = "/home/user/.local/state/music-ingest"
-kavita_root = "/home/user/.local/state/kavita-ingest"
-kavita_enabled = false
+# Default: $XDG_STATE_HOME/kavita-ingest (normally ~/.local/state/kavita-ingest).
+# Set only when kavita-ingest uses a custom state database location; this is the
+# parent directory of that database, never a media library path.
+# kavita_root = "/path/to/kavita-ingest-state"
