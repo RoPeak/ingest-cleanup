@@ -136,6 +136,8 @@ def kavita_records(config: Config, category: Category) -> tuple[list[Evidence], 
                 sh, dh = item.get("source_sha256"), item.get("destination_sha256")
                 if source is None or destination is None or not all(isinstance(x, str) and len(x) == 64 for x in (sh, dh)):
                     raise ValueError("item lacks safe paths or hashes")
+                if not source.is_relative_to(category.ingest_root) or not destination.is_relative_to(category.production_root):
+                    raise ValueError("item paths do not match configured category roots")
                 records.append(Evidence(source, destination, "kavita", report, f"{report}:{index}", sh, dh, bool(item.get("transformations"))))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
             rejected.append(RejectedReport(report, str(exc)))

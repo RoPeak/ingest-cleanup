@@ -68,10 +68,19 @@ def _hash(path: Path, progress: Callable[[Path, int, int], None] | None = None) 
 def _files(root: Path):
     for directory, names, files in os.walk(root, followlinks=False):
         directory_path = Path(directory)
-        names[:] = [name for name in names if not (directory_path / name).is_symlink()]
+        names[:] = [
+            name for name in names
+            if not (directory_path / name).is_symlink()
+            and name.casefold() != "__macosx"
+        ]
         for name in files:
             candidate = directory_path / name
-            if not candidate.is_symlink(): yield candidate
+            if candidate.is_symlink():
+                continue
+            lowered = name.casefold()
+            if lowered.startswith("._") or lowered in {".ds_store", "thumbs.db", "desktop.ini"}:
+                continue
+            yield candidate
 
 
 def assess_category(config: Config, category: Category, progress: Callable[[Path, int, int], None] | None = None, *, hash_files: bool = True) -> tuple[list[Assessment], list[RejectedReport]]:
