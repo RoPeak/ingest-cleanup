@@ -65,6 +65,47 @@ def _hash(path: Path, progress: Callable[[Path, int, int], None] | None = None) 
     return digest.hexdigest(), before
 
 
+def _mapping_viability_reason(
+    evidence: Evidence,
+    *,
+    source_id: Identity,
+    category: Category,
+    by_destination: dict[Path, list[Evidence]],
+) -> str | None:
+    """Return why evidence cannot currently support a source/destination check.
+
+    This is deliberately only a pre-hash eligibility screen. It is never
+    proof that a reused source pathname is safe to delete; SHA-256 comparison
+    remains mandatory in ``verify`` and ``apply``.
+    """
+    destination_records = by_destination.get(evidence.destination, [])
+    for other in destination_records:
+        if other.source == evidence.source:
+            continue
+        try:
+            if _inside(other.source, category.ingest_root) and _identity(other.source).links == 1:
+                return "ambiguous destination provenance with another current source"
+        except (OSError, ValueError):
+            # Historical reports whose source is absent or unsafe cannot prove
+            # anything about this current source-path reuse.
+            continue
+    if not _inside(evidence.destination, category.production_root):
+        return "published destination outside expected production root"
+    try:
+        destination_id = _identity(evidence.destination)
+        if destination_id.links != 1:
+            return "published destination unsafe: destination has hardlink count other than one"
+    except FileNotFoundError:
+        return "published destination missing"
+    except ValueError as exc:
+        return f"published destination unsafe: {exc}"
+    except OSError as exc:
+        return f"published destination unavailable: {exc}"
+    if not evidence.transformed and source_id.size != destination_id.size:
+        return "size mismatch"
+    return None
+
+
 def _files(root: Path):
     for directory, names, files in os.walk(root, followlinks=False):
         directory_path = Path(directory)
@@ -101,22 +142,32 @@ def assess_category(config: Config, category: Category, progress: Callable[[Path
         evidence_list = by_source.get(source)
         if not evidence_list:
             results.append(Assessment(category.name, source, None, "UNKNOWN", "insufficient proof", size=source_id.size, source_identity=source_id)); continue
-        if len(evidence_list) != 1:
-            results.append(Assessment(category.name, source, None, "UNKNOWN", "ambiguous source provenance", size=source_id.size, source_identity=source_id)); continue
-        evidence = evidence_list[0]
-        if len(by_destination.get(evidence.destination, [])) != 1:
-            results.append(Assessment(category.name, source, evidence.destination, "UNKNOWN", "ambiguous destination provenance", evidence, source_id.size, source_id)); continue
-        if not _inside(evidence.destination, category.production_root):
-            results.append(Assessment(category.name, source, evidence.destination, "UNKNOWN", "destination outside expected production root", evidence, source_id.size, source_id)); continue
-        try:
-            destination_id = _identity(evidence.destination)
-            if destination_id.links != 1: raise ValueError("destination has hardlink count other than one")
-        except (OSError, ValueError):
-            results.append(Assessment(category.name, source, evidence.destination, "REVIEW", "published destination missing or unsafe", evidence, source_id.size, source_id)); continue
-        if not evidence.transformed and source_id.size != destination_id.size:
-            results.append(Assessment(category.name, source, evidence.destination, "REVIEW", "size mismatch", evidence, source_id.size, source_id)); continue
+        viable_by_destination: dict[Path, Evidence] = {}
+        stale: list[tuple[Evidence, str]] = []
+        for evidence in evidence_list:
+            reason = _mapping_viability_reason(
+                evidence,
+                source_id=source_id,
+                category=category,
+                by_destination=by_destination,
+            )
+            if reason is None:
+                # Repeated reports for the same current source/destination do
+                # not create a conflicting mapping; deduplicate only after
+                # each record has passed the current-filesystem checks.
+                viable_by_destination.setdefault(evidence.destination, evidence)
+            else:
+                stale.append((evidence, reason))
+        if len(viable_by_destination) > 1:
+            results.append(Assessment(category.name, source, None, "UNKNOWN", "multiple currently valid source provenance mappings", size=source_id.size, source_identity=source_id)); continue
+        if not viable_by_destination:
+            evidence, reason = stale[0]
+            results.append(Assessment(category.name, source, evidence.destination, "REVIEW", reason, evidence, source_id.size, source_id)); continue
+        evidence = next(iter(viable_by_destination.values()))
+        destination_id = _identity(evidence.destination)
         if not hash_files:
-            results.append(Assessment(category.name, source, evidence.destination, "CANDIDATE", "provenance and size checks passed; hash verification required", evidence, source_id.size, source_id)); continue
+            suffix = f"; ignored {len(stale)} stale provenance mapping(s)" if stale else ""
+            results.append(Assessment(category.name, source, evidence.destination, "CANDIDATE", f"provenance and size checks passed; hash verification required{suffix}", evidence, source_id.size, source_id)); continue
         try:
             source_hash, source_id = _hash(source, progress)
             destination_hash, _ = _hash(evidence.destination, progress)

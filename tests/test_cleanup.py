@@ -77,7 +77,7 @@ def test_unsuccessful_video_report_is_not_proof(tmp_path: Path, mode: str, copy:
     assert items[0].state == "UNKNOWN" and bad
 
 
-@pytest.mark.parametrize("destination_bytes,reason", [(None, "published destination missing or unsafe"), (b"xx", "size mismatch"), (b"y", "content mismatch")])
+@pytest.mark.parametrize("destination_bytes,reason", [(None, "published destination missing"), (b"xx", "size mismatch"), (b"y", "content mismatch")])
 def test_current_destination_failures(tmp_path: Path, destination_bytes: bytes | None, reason: str):
     ingest, production, state, category, config = setup(tmp_path)
     source = ingest / "source"; destination = production / "dest"; source.write_bytes(b"x")
@@ -85,6 +85,24 @@ def test_current_destination_failures(tmp_path: Path, destination_bytes: bytes |
     video(state / "run" / "reports" / "report.json", source, destination)
     items, _ = assess_category(config, category)
     assert items[0].state == "REVIEW" and items[0].reason == reason
+
+
+def test_destination_outside_production_or_symlink_is_review(tmp_path: Path):
+    ingest, production, state, category, config = setup(tmp_path)
+    source = ingest / "source"; source.write_bytes(b"x")
+    outside = tmp_path / "outside"; outside.write_bytes(b"x")
+    video(state / "run" / "reports" / "outside.json", source, outside)
+    items, _ = assess_category(config, category)
+    assert items[0].state == "REVIEW"
+    assert items[0].reason == "published destination outside expected production root"
+
+    (state / "run" / "reports" / "outside.json").unlink()
+    target = production / "target"; target.write_bytes(b"x")
+    link = production / "link"; link.symlink_to(target)
+    video(state / "run" / "reports" / "symlink.json", source, link)
+    items, _ = assess_category(config, category)
+    assert items[0].state == "REVIEW"
+    assert items[0].reason == "published destination unsafe: not a regular non-symlink file"
 
 
 def test_ambiguity_and_outside_path_fail_closed(tmp_path: Path):
@@ -95,6 +113,65 @@ def test_ambiguity_and_outside_path_fail_closed(tmp_path: Path):
     report.write_text("\n".join(json.dumps(row) for row in rows))
     items, _ = assess_category(config, category)
     assert items[0].state == "UNKNOWN"
+
+
+def test_stale_v1_mapping_does_not_mask_unique_v2_existing_duplicate(tmp_path: Path):
+    ingest, production, state, category, config = setup(tmp_path)
+    source = ingest / "Banshee (2013) - s02e01 - Little Fish.mkv"
+    canonical = production / "Banshee (2013) - s02e01 - Little Fish.mkv"
+    stale = production / "Banshee (2013) - s02e01 - Little Fish (2).mkv"
+    source.write_bytes(b"same bytes"); canonical.write_bytes(b"same bytes")
+    video(state / "run" / "reports" / "old.json", source, stale)
+    report = state / "run" / "reports" / "current.json"
+    report.write_text("\n".join(json.dumps(row) for row in [
+        {"type": "header", "mode": "apply", "copy": True, "version": 2},
+        {"type": "operation", "source": str(source), "destination": str(canonical), "media_type": "tv", "metadata": {}, "action": "verified-existing-duplicate"},
+        {"type": "final", "operations": 1},
+    ]) + "\n")
+
+    candidates, rejected = assess_category(config, category, hash_files=False)
+    assert not rejected and candidates[0].state == "CANDIDATE"
+    assert candidates[0].destination == canonical
+    assert "ignored 1 stale provenance mapping" in candidates[0].reason
+    verified, rejected = assess_category(config, category)
+    assert not rejected and verified[0].state == "SAFE"
+
+
+def test_reused_source_path_requires_current_size_and_hash_match(tmp_path: Path):
+    ingest, production, state, category, config = setup(tmp_path)
+    source = ingest / "reused.mkv"; destination = production / "published.mkv"
+    source.write_bytes(b"new source"); destination.write_bytes(b"old")
+    video(state / "run" / "reports" / "old.json", source, destination)
+    items, _ = assess_category(config, category, hash_files=False)
+    assert items[0].state == "REVIEW" and items[0].reason == "size mismatch"
+
+    destination.write_bytes(b"old bytes!")
+    assert len(destination.read_bytes()) == len(source.read_bytes())
+    candidates, _ = assess_category(config, category, hash_files=False)
+    assert candidates[0].state == "CANDIDATE"
+    verified, _ = assess_category(config, category)
+    assert verified[0].state == "REVIEW" and verified[0].reason == "content mismatch"
+
+
+def test_two_current_sources_for_one_destination_remain_ambiguous(tmp_path: Path):
+    ingest, production, state, category, config = setup(tmp_path)
+    first = ingest / "first.mkv"; second = ingest / "second.mkv"; destination = production / "episode.mkv"
+    first.write_bytes(b"same"); second.write_bytes(b"same"); destination.write_bytes(b"same")
+    video(state / "run" / "reports" / "first.json", first, destination)
+    video(state / "run" / "reports" / "second.json", second, destination)
+    items, _ = assess_category(config, category, hash_files=False)
+    assert {item.state for item in items} == {"REVIEW"}
+    assert {item.reason for item in items} == {"ambiguous destination provenance with another current source"}
+
+
+def test_repeated_same_source_destination_records_are_deduplicated_after_validation(tmp_path: Path):
+    ingest, production, state, category, config = setup(tmp_path)
+    source = ingest / "source.mkv"; destination = production / "episode.mkv"
+    source.write_bytes(b"same"); destination.write_bytes(b"same")
+    video(state / "run" / "reports" / "one.json", source, destination)
+    video(state / "run" / "reports" / "two.json", source, destination)
+    items, _ = assess_category(config, category, hash_files=False)
+    assert len(items) == 1 and items[0].state == "CANDIDATE"
 
 
 def test_symlink_hardlink_and_root_overlap_are_rejected(tmp_path: Path):
