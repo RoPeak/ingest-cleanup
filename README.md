@@ -45,6 +45,12 @@ The tool never treats its own audit reports as ingestion evidence. Missing,
 ambiguous, changed, symlinked, hard-linked, or otherwise unsafe files are left
 for review rather than deleted.
 
+For video ingest, a completed COPY report can also identify a source that was
+skipped because the canonical production item was SHA-256-identical. This is
+provenance only: `status` remains non-destructive and `verify`/`apply` always
+recompute both hashes before a source can become deletion-ready. User-skipped
+or non-identical conflicts are never accepted as cleanup evidence.
+
 ## Development
 
 Run the synthetic test suite with:

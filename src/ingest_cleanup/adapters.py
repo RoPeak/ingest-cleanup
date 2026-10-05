@@ -53,7 +53,11 @@ def video_records(config: Config, category: Category) -> tuple[list[Evidence], l
                 rejected.append(RejectedReport(report, "unsafe report path")); continue
             try:
                 rows = [json.loads(line) for line in report.read_text(encoding="utf-8").splitlines() if line.strip()]
-                if len(rows) < 2 or not isinstance(rows[0], dict) or rows[0] != {"type": "header", "mode": "apply", "copy": True, "version": 1}:
+                if len(rows) < 2 or not isinstance(rows[0], dict):
+                    raise ValueError("not a successful COPY JSON Lines report")
+                header = rows[0]
+                version = header.get("version")
+                if version not in {1, 2} or header.get("type") != "header" or header.get("mode") != "apply" or header.get("copy") is not True:
                     raise ValueError("not a successful COPY JSON Lines report")
                 if not isinstance(rows[-1], dict) or rows[-1].get("type") != "final":
                     raise ValueError("missing final record")
@@ -64,6 +68,9 @@ def video_records(config: Config, category: Category) -> tuple[list[Evidence], l
                     source, destination = _absolute_clean(row.get("source")), _absolute_clean(row.get("destination"))
                     if source is None or destination is None:
                         raise ValueError("operation has an unsafe path")
+                    action = "published" if version == 1 else row.get("action")
+                    if action not in {"published", "verified-existing-duplicate"}:
+                        raise ValueError("operation has unsupported action")
                     records.append(Evidence(source, destination, "video", report, f"{report}:{index}"))
             except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
                 rejected.append(RejectedReport(report, str(exc)))

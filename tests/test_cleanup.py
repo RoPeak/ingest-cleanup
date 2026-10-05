@@ -33,6 +33,41 @@ def test_success_and_conflict_destination(tmp_path: Path):
     assert not bad and [(item.state, item.destination) for item in items] == [("SAFE", destination)]
 
 
+def test_v2_verified_existing_duplicate_requires_fresh_hash_verification(tmp_path: Path):
+    ingest, production, state, category, config = setup(tmp_path)
+    source = ingest / "O'Brien S01E01.mkv"; destination = production / "O'Brien S01E01.mkv"
+    source.write_bytes(b"same bytes"); destination.write_bytes(b"same bytes")
+    report = state / "run" / "reports" / "copy.json"
+    rows = [
+        {"type": "header", "mode": "apply", "copy": True, "version": 2},
+        {"type": "operation", "source": str(source), "destination": str(destination), "media_type": "tv", "metadata": {}, "action": "verified-existing-duplicate"},
+        {"type": "final", "operations": 1},
+    ]
+    report.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    candidates, bad = assess_category(config, category, hash_files=False)
+    assert not bad and candidates[0].state == "CANDIDATE"
+    verified, bad = assess_category(config, category)
+    assert not bad and verified[0].state == "SAFE"
+    destination.write_bytes(b"changed")
+    assert assess_category(config, category)[0][0].state == "REVIEW"
+
+
+def test_v2_user_skip_is_not_accepted_provenance(tmp_path: Path):
+    ingest, production, state, category, config = setup(tmp_path)
+    source = ingest / "source.mkv"; destination = production / "destination.mkv"
+    source.write_bytes(b"incoming"); destination.write_bytes(b"different")
+    report = state / "run" / "reports" / "copy.json"
+    rows = [
+        {"type": "header", "mode": "apply", "copy": True, "version": 2},
+        {"type": "operation", "source": str(source), "destination": str(destination), "media_type": "tv", "metadata": {}, "action": "user-skipped"},
+        {"type": "final", "operations": 1},
+    ]
+    report.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    items, rejected = assess_category(config, category)
+    assert not items or items[0].state == "UNKNOWN"
+    assert rejected
+
+
 @pytest.mark.parametrize("mode,copy,final", [("dry-run", True, True), ("apply", False, True), ("apply", True, False)])
 def test_unsuccessful_video_report_is_not_proof(tmp_path: Path, mode: str, copy: bool, final: bool):
     ingest, production, state, category, config = setup(tmp_path)
