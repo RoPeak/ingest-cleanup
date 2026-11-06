@@ -7,8 +7,15 @@ from pathlib import Path
 import pytest
 
 from ingest_cleanup.config import Category, Config, kavita_xdg_state, validate
-from ingest_cleanup.core import apply_deletions, assess_category, write_audit
-from ingest_cleanup import cli
+from ingest_cleanup.core import (
+    apply_deletions,
+    assess_category,
+    create_verification_plan,
+    load_verification_plan,
+    verify_saved_plan,
+    write_audit,
+)
+from ingest_cleanup import cli, core as core_module
 
 
 def setup(tmp_path: Path):
@@ -185,12 +192,158 @@ def test_symlink_hardlink_and_root_overlap_are_rejected(tmp_path: Path):
     with pytest.raises(ValueError): validate(Config((Category("bad", ingest, ingest / "nested", "disabled"),), (), None, False))
 
 
-def test_apply_rechecks_identity_and_prunes(tmp_path: Path):
+def test_apply_rechecks_identity_and_prunes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
     ingest, production, state, category, config = setup(tmp_path)
     nested = ingest / "nested"; nested.mkdir(); source = nested / "source"; destination = production / "dest"; source.write_bytes(b"x"); destination.write_bytes(b"x")
     video(state / "run" / "reports" / "report.json", source, destination)
     items, _ = assess_category(config, category); payload = apply_deletions(items, {"TV": ingest})
     assert payload["items"][0]["result"] == "deleted" and not source.exists() and ingest.exists() and not nested.exists()
+
+
+def test_v3_mixed_move_accepts_only_preserved_duplicate(tmp_path: Path):
+    ingest, production, state, category, config = setup(tmp_path)
+    moved = ingest / "moved.mkv"; duplicate = ingest / "duplicate.mkv"
+    moved_dest = production / "moved.mkv"; duplicate_dest = production / "duplicate.mkv"
+    for path in (moved, moved_dest, duplicate, duplicate_dest): path.write_bytes(path.name.encode())
+    duplicate_dest.write_bytes(duplicate.read_bytes())
+    report = state / "run" / "reports" / "mixed.json"
+    digest = hashlib.sha256(duplicate.read_bytes()).hexdigest()
+    rows = [
+        {"type":"header", "mode":"apply", "copy":False, "version":3},
+        {"type":"operation", "source":str(moved), "destination":str(moved_dest), "action":"published", "source_lifecycle":"removed", "verification":"destination-created"},
+        {"type":"operation", "source":str(duplicate), "destination":str(duplicate_dest), "action":"verified-existing-duplicate", "source_lifecycle":"preserved", "verification":"sha256", "source_sha256":digest, "destination_sha256":digest},
+        {"type":"final", "operations":2, "status":"completed"},
+    ]
+    report.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    items, rejected = assess_category(config, category)
+    assert not rejected
+    assert next(item for item in items if item.source == duplicate).state == "SAFE"
+    assert next(item for item in items if item.source == moved).reason_code == "NO_ACCEPTED_REPORT"
+
+
+def test_saved_plan_expiry_config_drift_and_endpoint_replacement_fail_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
+    ingest, production, state, category, config = setup(tmp_path)
+    source = ingest / "source"; destination = production / "dest"
+    source.write_bytes(b"same"); destination.write_bytes(b"same")
+    video(state / "run" / "reports" / "report.json", source, destination)
+    safe, _ = assess_category(config, category)
+    plan_id, path = create_verification_plan(config, safe)
+    assert path.stat().st_mode & 0o777 == 0o400
+    payload, _ = load_verification_plan(config, plan_id)
+    assert verify_saved_plan(config, payload)[0].state == "SAFE"
+
+    replacement = production / "replacement"; replacement.mkdir()
+    drifted = Config((Category("TV", ingest, replacement, "video"),), (state,), None, False)
+    with pytest.raises(ValueError, match="configuration"):
+        load_verification_plan(drifted, plan_id)
+
+    destination.unlink(); destination.write_bytes(b"same")
+    with pytest.raises(ValueError, match="identity"):
+        verify_saved_plan(config, payload)
+
+    path.chmod(0o600)
+    expired = json.loads(path.read_text()); expired["expires_at"] = "2000-01-01T00:00:00+00:00"
+    path.write_text(json.dumps(expired)); path.chmod(0o400)
+    with pytest.raises(ValueError, match="integrity"):
+        load_verification_plan(config, plan_id)
+    path.chmod(0o600)
+    expired.pop("integrity_sha256")
+    expired["integrity_sha256"] = hashlib.sha256(json.dumps(expired, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    path.write_text(json.dumps(expired)); path.chmod(0o400)
+    with pytest.raises(ValueError, match="expired"):
+        load_verification_plan(config, plan_id)
+
+
+def test_batch_destination_change_aborts_before_any_deletion(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
+    ingest, production, state, category, config = setup(tmp_path)
+    sources = [ingest / "one", ingest / "two"]; destinations = [production / "one", production / "two"]
+    for index, (source, destination) in enumerate(zip(sources, destinations)):
+        source.write_bytes(str(index).encode()); destination.write_bytes(str(index).encode())
+        video(state / "run" / "reports" / f"{index}.json", source, destination)
+    safe, _ = assess_category(config, category)
+    destinations[1].write_bytes(b"changed")
+    payload = apply_deletions(safe, {"TV": ingest})
+    assert payload["status"] == "partial-failure"
+    assert all(source.exists() for source in sources)
+
+
+def test_prevalidation_cancellation_records_interrupted_audit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
+    ingest, production, state, category, config = setup(tmp_path)
+    source = ingest / "source"; destination = production / "destination"
+    source.write_bytes(b"same"); destination.write_bytes(b"same")
+    video(state / "run" / "reports" / "report.json", source, destination)
+    safe, _ = assess_category(config, category)
+    audit = tmp_path / "audit.json"
+
+    def cancel(_path: Path, _complete: int, _total: int) -> None:
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        apply_deletions(safe, {"TV": ingest}, audit, cancel)
+    assert source.exists()
+    assert json.loads(audit.read_text())["status"] == "interrupted"
+
+
+def test_deletion_interruption_retains_crash_safe_audit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
+    ingest, production, state, category, config = setup(tmp_path)
+    source = ingest / "source"; destination = production / "destination"
+    source.write_bytes(b"same"); destination.write_bytes(b"same")
+    video(state / "run" / "reports" / "report.json", source, destination)
+    safe, _ = assess_category(config, category)
+    audit = tmp_path / "audit.json"
+
+    original_unlink = Path.unlink
+
+    def interrupt(path: Path, *args, **kwargs) -> None:
+        if path == source:
+            raise KeyboardInterrupt
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        apply_deletions(safe, {"TV": ingest}, audit)
+    assert source.exists()
+    assert json.loads(audit.read_text())["status"] == "interrupted"
+
+
+def test_first_deletion_race_stops_batch_and_retains_partial_audit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
+    ingest, production, state, category, config = setup(tmp_path)
+    sources = [ingest / "one", ingest / "two"]
+    destinations = [production / "one", production / "two"]
+    for index, (source, destination) in enumerate(zip(sources, destinations)):
+        source.write_bytes(str(index).encode()); destination.write_bytes(str(index).encode())
+        video(state / "run" / "reports" / f"{index}.json", source, destination)
+    safe, _ = assess_category(config, category)
+    safe.sort(key=lambda item: item.source.name)
+    audit = tmp_path / "audit.json"
+    original_identity = core_module._identity
+    raced = False
+    first_destination_checks = 0
+
+    def race(path: Path):
+        nonlocal raced, first_destination_checks
+        if path == destinations[0]:
+            first_destination_checks += 1
+        # Prevalidation hashes the destination and checks its identity twice.
+        # Change the second source only at the first item's immediate-delete
+        # destination recheck, after the whole batch has passed prevalidation.
+        if path == destinations[0] and first_destination_checks == 3 and not raced:
+            raced = True
+            sources[1].write_bytes(b"changed after batch verification")
+        return original_identity(path)
+
+    monkeypatch.setattr(core_module, "_identity", race)
+    payload = apply_deletions(safe, {"TV": ingest}, audit)
+    persisted = json.loads(audit.read_text())
+    assert payload["status"] == persisted["status"] == "partial-failure"
+    assert [item["result"] for item in persisted["items"]] == ["deleted", "skipped"]
+    assert not sources[0].exists() and sources[1].exists()
 
 
 def test_changed_source_during_hash_is_review(tmp_path: Path):
@@ -321,6 +474,25 @@ def test_kavita_default_state_root_uses_xdg(tmp_path: Path, monkeypatch: pytest.
     assert kavita_xdg_state() == tmp_path / "kavita-ingest"
 
 
+def test_kavita_v2_mixed_lifecycle_accepts_only_preserved_item(tmp_path: Path):
+    ingest = tmp_path / "incoming"; production = tmp_path / "library"; state = tmp_path / "state"
+    ingest.mkdir(); production.mkdir(); (state / "kavita-reports").mkdir(parents=True)
+    preserved = ingest / "preserved.cbz"; removed = ingest / "removed.cbz"
+    preserved_dest = production / "preserved.cbz"; removed_dest = production / "removed.cbz"
+    for source, destination in ((preserved, preserved_dest), (removed, removed_dest)):
+        source.write_bytes(source.name.encode()); destination.write_bytes(source.read_bytes())
+    def item(source: Path, destination: Path, lifecycle: str) -> dict[str, object]:
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        return {"source":str(source), "destination":str(destination), "source_sha256":digest, "destination_sha256":digest, "source_lifecycle":lifecycle, "action":"verified-existing-duplicate", "transformations":[]}
+    report = {"report_schema":"kavita-ingest-publication-v2", "approved_apply":True, "status":"completed", "source_lifecycle":"mixed", "verification_completed":True, "recovery_required":False, "items":[item(preserved, preserved_dest, "preserved"), item(removed, removed_dest, "removed")]}
+    (state / "kavita-reports" / "run.json").write_text(json.dumps(report))
+    category = Category("Comics", ingest, production, "kavita")
+    results, rejected = assess_category(Config((category,), (), None, True, state), category)
+    assert not rejected
+    assert next(value for value in results if value.source == preserved).state == "SAFE"
+    assert next(value for value in results if value.source == removed).state == "UNKNOWN"
+
+
 def test_apply_empty_result_uses_mode_aware_completion_message(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ):
@@ -340,3 +512,46 @@ def test_apply_requires_exact_typed_confirmation(tmp_path: Path, monkeypatch: py
     monkeypatch.setattr(cli, "_load", lambda path: config)
     monkeypatch.setattr("builtins.input", lambda prompt: "delete verified sources")
     assert cli.main(["apply"]) == 0 and source.exists()
+
+
+def test_apply_accepts_counted_confirmation_and_writes_completed_audit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    ingest, production, state, category, config = setup(tmp_path)
+    source = ingest / "source"; destination = production / "dest"; source.write_bytes(b"x"); destination.write_bytes(b"x")
+    video(state / "run" / "reports" / "report.json", source, destination)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setattr(cli, "_load", lambda path: config)
+    monkeypatch.setattr("builtins.input", lambda prompt: "DELETE 1 VERIFIED SOURCES")
+    assert cli.main(["apply"]) == 0 and not source.exists()
+    audit = next((tmp_path / "xdg" / "ingest-cleanup" / "reports").glob("*.json"))
+    assert json.loads(audit.read_text())["status"] == "completed"
+
+
+def test_saved_plan_cli_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
+    """Exercise producer evidence through saved review, apply, and audit."""
+    ingest, production, state, category, config = setup(tmp_path)
+    source = ingest / "synthetic-source.mkv"
+    destination = production / "synthetic-destination.mkv"
+    source.write_bytes(b"synthetic media bytes")
+    destination.write_bytes(source.read_bytes())
+    video(state / "run" / "reports" / "report.json", source, destination)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setattr(cli, "_load", lambda path: config)
+
+    assert cli.main(["verify"]) == 0
+    assert "Saved verification plan:" in capsys.readouterr().out
+    plan_file = next((tmp_path / "xdg" / "ingest-cleanup" / "plans").glob("*.json"))
+    plan_id = plan_file.stem
+
+    assert cli.main(["show", plan_id]) == 0
+    shown = capsys.readouterr().out
+    assert '"schema": "verification-plan-v1"' in shown
+    assert str(source) in shown and str(destination) in shown
+
+    monkeypatch.setattr("builtins.input", lambda prompt: "DELETE 1 VERIFIED SOURCES")
+    assert cli.main(["apply", plan_id]) == 0
+    assert not source.exists()
+    assert destination.read_bytes() == b"synthetic media bytes"
+    audit = next((tmp_path / "xdg" / "ingest-cleanup" / "reports").glob("*.json"))
+    payload = json.loads(audit.read_text())
+    assert payload["status"] == "completed"
+    assert payload["items"][0]["result"] == "deleted"
