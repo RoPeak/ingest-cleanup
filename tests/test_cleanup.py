@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from ingest_cleanup import cli
+from ingest_cleanup import core as core_module
 from ingest_cleanup.config import Category, Config, kavita_xdg_state, validate
 from ingest_cleanup.core import (
     apply_deletions,
@@ -15,7 +17,6 @@ from ingest_cleanup.core import (
     verify_saved_plan,
     write_audit,
 )
-from ingest_cleanup import cli, core as core_module
 
 
 def setup(tmp_path: Path):
@@ -220,6 +221,113 @@ def test_v3_mixed_move_accepts_only_preserved_duplicate(tmp_path: Path):
     assert not rejected
     assert next(item for item in items if item.source == duplicate).state == "SAFE"
     assert next(item for item in items if item.source == moved).reason_code == "NO_ACCEPTED_REPORT"
+
+
+def test_kavita_v3_partial_report_accepts_only_complete_items(tmp_path: Path):
+    ingest = tmp_path / "incoming"; production = tmp_path / "books"; state = tmp_path / "state"
+    ingest.mkdir(); production.mkdir(); (state / "kavita-reports").mkdir(parents=True)
+    complete = ingest / "complete.epub"; failed = ingest / "failed.epub"
+    destination = production / "complete.epub"
+    complete.write_bytes(b"published"); destination.write_bytes(b"published")
+    failed.write_bytes(b"not published")
+    digest = hashlib.sha256(b"published").hexdigest()
+    payload = {
+        "report_schema": "kavita-ingest-publication-v3",
+        "approved_apply": True,
+        "status": "partial",
+        "source_lifecycle": "preserved",
+        "verification_completed": True,
+        "recovery_required": True,
+        "items": [
+            {
+                "item_id": "complete",
+                "item_state": "complete",
+                "cleanup_eligible": True,
+                "source_lifecycle": "preserved",
+                "action": "published",
+                "source": str(complete),
+                "destination": str(destination),
+                "source_sha256": digest,
+                "destination_sha256": digest,
+                "transformations": [],
+            },
+            {
+                "item_id": "failed",
+                "item_state": "failed",
+                "cleanup_eligible": False,
+                "source_lifecycle": "preserved",
+                "source": str(failed),
+                "destination": str(production / "failed.epub"),
+            },
+        ],
+    }
+    (state / "kavita-reports" / "partial.json").write_text(json.dumps(payload))
+    category = Category("Books", ingest, production, "kavita")
+    config = Config((category,), (), None, True, state)
+
+    items, rejected = assess_category(config, category)
+
+    assert not rejected
+    complete_item = next(item for item in items if item.source == complete)
+    assert complete_item.state == "BACKUP_REQUIRED"
+    assert complete_item.reason_code == "INDEPENDENT_BACKUP_REQUIRED"
+    assert next(item for item in items if item.source == failed).reason_code == "NO_ACCEPTED_REPORT"
+    with pytest.raises(ValueError, match="deletion-ready"):
+        create_verification_plan(config, [complete_item])
+
+
+def test_legacy_saved_plan_cannot_bypass_kavita_backup_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
+    ingest = tmp_path / "incoming"; production = tmp_path / "books"
+    ingest.mkdir(); production.mkdir()
+    source = ingest / "published.epub"; destination = production / "published.epub"
+    source.write_bytes(b"same"); destination.write_bytes(b"same")
+    source_id = core_module._identity(source)
+    destination_id = core_module._identity(destination)
+    digest = hashlib.sha256(b"same").hexdigest()
+    category = Category("Books", ingest, production, "kavita")
+    config = Config((category,), (), None, True, tmp_path / "producer-state")
+    legacy_safe = core_module.Assessment(
+        "Books", source, destination, "SAFE", "legacy verification",
+        size=source_id.size, source_identity=source_id, sha256=digest,
+        reason_code="VERIFIED", destination_identity=destination_id,
+        destination_sha256=digest,
+    )
+
+    plan_id, _ = create_verification_plan(config, [legacy_safe])
+    payload, _ = load_verification_plan(config, plan_id)
+    reverified = verify_saved_plan(config, payload)
+
+    assert reverified[0].state == "BACKUP_REQUIRED"
+    assert reverified[0].reason_code == "INDEPENDENT_BACKUP_REQUIRED"
+
+
+def test_kavita_v3_never_accepts_incomplete_item_marked_eligible(tmp_path: Path):
+    ingest = tmp_path / "incoming"; production = tmp_path / "books"; state = tmp_path / "state"
+    ingest.mkdir(); production.mkdir(); (state / "kavita-reports").mkdir(parents=True)
+    source = ingest / "failed.epub"; destination = production / "failed.epub"
+    source.write_bytes(b"same"); destination.write_bytes(b"same")
+    digest = hashlib.sha256(b"same").hexdigest()
+    payload = {
+        "report_schema": "kavita-ingest-publication-v3", "approved_apply": True,
+        "status": "partial", "source_lifecycle": "preserved",
+        "verification_completed": True, "recovery_required": True,
+        "items": [{"item_state": "failed", "cleanup_eligible": True,
+                   "source_lifecycle": "preserved", "action": "published",
+                   "source": str(source), "destination": str(destination),
+                   "source_sha256": digest, "destination_sha256": digest}],
+    }
+    report = state / "kavita-reports" / "unsafe.json"
+    report.write_text(json.dumps(payload))
+    category = Category("Books", ingest, production, "kavita")
+    config = Config((category,), (), None, True, state)
+
+    items, rejected = assess_category(config, category)
+
+    assert rejected and rejected[0].path == report
+    assert next(item for item in items if item.source == source).reason_code == "NO_ACCEPTED_REPORT"
 
 
 def test_saved_plan_expiry_config_drift_and_endpoint_replacement_fail_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -461,7 +569,8 @@ def test_kavita_publication_reports_are_discovered_and_fail_closed(
     candidate, rejected = assess_category(config, category, hash_files=False)
     assert not rejected and candidate[0].state == "CANDIDATE"
     verified, rejected = assess_category(config, category, hash_files=True)
-    assert not rejected and verified[0].state == "SAFE"
+    assert not rejected and verified[0].state == "BACKUP_REQUIRED"
+    assert verified[0].reason_code == "INDEPENDENT_BACKUP_REQUIRED"
     source.write_bytes(b"changed source")
     assert assess_category(config, category)[0][0].state == "REVIEW"
     source.write_bytes(b"original")
@@ -489,7 +598,7 @@ def test_kavita_v2_mixed_lifecycle_accepts_only_preserved_item(tmp_path: Path):
     category = Category("Comics", ingest, production, "kavita")
     results, rejected = assess_category(Config((category,), (), None, True, state), category)
     assert not rejected
-    assert next(value for value in results if value.source == preserved).state == "SAFE"
+    assert next(value for value in results if value.source == preserved).state == "BACKUP_REQUIRED"
     assert next(value for value in results if value.source == removed).state == "UNKNOWN"
 
 

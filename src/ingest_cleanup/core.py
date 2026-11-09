@@ -202,7 +202,23 @@ def assess_category(config: Config, category: Category, progress: Callable[[Path
                 results.append(Assessment(category.name, source, evidence.destination, "REVIEW", "destination differs from recorded publication output", evidence, source_id.size, source_id, reason_code="HASH_MISMATCH")); continue
             if not evidence.transformed and source_hash != destination_hash:
                 results.append(Assessment(category.name, source, evidence.destination, "REVIEW", "content mismatch", evidence, source_id.size, source_id, reason_code="HASH_MISMATCH")); continue
-            results.append(Assessment(category.name, source, evidence.destination, "SAFE", "production copy verified", evidence, source_id.size, source_id, source_hash, "VERIFIED", destination_id, destination_hash))
+            if category.adapter == "kavita":
+                results.append(Assessment(
+                    category.name,
+                    source,
+                    evidence.destination,
+                    "BACKUP_REQUIRED",
+                    "production copy verified; independent per-file backup proof is unavailable",
+                    evidence,
+                    source_id.size,
+                    source_id,
+                    source_hash,
+                    "INDEPENDENT_BACKUP_REQUIRED",
+                    destination_id,
+                    destination_hash,
+                ))
+            else:
+                results.append(Assessment(category.name, source, evidence.destination, "SAFE", "production copy verified", evidence, source_id.size, source_id, source_hash, "VERIFIED", destination_id, destination_hash))
         except (OSError, ValueError) as exc:
             text = str(exc); results.append(Assessment(category.name, source, evidence.destination, "REVIEW", text, evidence, source_id.size, source_id, reason_code=reason_code(text)))
     return results, rejected
@@ -238,6 +254,8 @@ def config_fingerprint(config: Config) -> str:
 
 
 def create_verification_plan(config: Config, items: list[Assessment]) -> tuple[str, Path]:
+    if not items or any(item.state != "SAFE" for item in items):
+        raise ValueError("verification plans require at least one deletion-ready item")
     now = datetime.now(UTC)
     plan_id = now.strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(6)
     folder = xdg_state() / "plans"; folder.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -305,7 +323,24 @@ def verify_saved_plan(config: Config, payload: dict[str, object], progress: Call
             raise ValueError("planned endpoint identity changed")
         if source_hash != raw.get("source_sha256") or destination_hash != raw.get("destination_sha256"):
             raise ValueError("planned endpoint hash changed")
-        verified.append(Assessment(category.name, source, destination, "SAFE", "saved plan reverified", None, source_id.size, source_id, source_hash, "VERIFIED", destination_id, destination_hash, str(raw.get("evidence_identifier")) if raw.get("evidence_identifier") else None))
+        if category.adapter == "kavita":
+            verified.append(Assessment(
+                category.name,
+                source,
+                destination,
+                "BACKUP_REQUIRED",
+                "saved endpoints reverified; independent per-file backup proof is unavailable",
+                None,
+                source_id.size,
+                source_id,
+                source_hash,
+                "INDEPENDENT_BACKUP_REQUIRED",
+                destination_id,
+                destination_hash,
+                str(raw.get("evidence_identifier")) if raw.get("evidence_identifier") else None,
+            ))
+        else:
+            verified.append(Assessment(category.name, source, destination, "SAFE", "saved plan reverified", None, source_id.size, source_id, source_hash, "VERIFIED", destination_id, destination_hash, str(raw.get("evidence_identifier")) if raw.get("evidence_identifier") else None))
     return verified
 
 

@@ -63,13 +63,21 @@ or non-identical conflicts are never accepted as cleanup evidence.
 JSONL v3 also supports mixed MOVE reports: only per-operation records whose
 `source_lifecycle` is `preserved` are eligible, so moved sources remain excluded
 while SHA-256-verified existing duplicates retain usable evidence. Legacy
-video, music, and Kavita schemas remain readable. Unknown versions and
+Kavita publication v3 may also represent a partial producer run: only entries
+with `item_state=complete` and `cleanup_eligible=true` are consumed. Failed,
+blocked, and uncertain siblings provide no evidence but do not invalidate an
+independently completed item. Video, music, and Kavita v1/v2 schemas remain
+readable. Unknown versions and
 incomplete reports fail closed. Historical sources become eligible only after
 replaying their authoritative producer; cleanup never guesses a destination.
 
 Byte identity with production proves publication equality, not independent
 backup coverage. Cleanup reports this limitation and does not infer backup
-freshness from the production copy.
+freshness from the production copy. Kavita publications therefore stop at
+`BACKUP_REQUIRED` after fresh source/destination SHA-256 verification. They are
+excluded from saved deletion plans and `apply`, including plans created by an
+older version. Keep those Incoming files until a trustworthy independent
+per-file backup-evidence adapter exists.
 
 ## Development
 

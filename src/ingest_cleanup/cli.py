@@ -89,6 +89,7 @@ def _print(
         print(f"  Incoming files: {len(values)}")
         print(f"  Candidate:      {counts['CANDIDATE']}")
         print(f"  Safe:           {counts['SAFE']}")
+        print(f"  Backup needed:  {counts['BACKUP_REQUIRED']}")
         print(f"  Review:         {counts['REVIEW']}")
         print(f"  Unknown:        {counts['UNKNOWN']}")
         if verbose:
@@ -112,6 +113,12 @@ def _print(
         print("Missing proof is resolved by replaying the authoritative producer; cleanup does not infer paths:")
         for adapter, count in sorted(missing.items()):
             print(f"  {count}: rerun `{commands[adapter]}`")
+    backup_required = sum(value.state == "BACKUP_REQUIRED" for value in results)
+    if backup_required:
+        print(
+            f"{backup_required} verified publication(s) remain in Incoming because no "
+            "independent per-file backup proof is available. They are not deletion-ready."
+        )
     if not apply_mode:
         print("No files were deleted. Run `ingest-cleanup apply` to verify and review deletion.")
 

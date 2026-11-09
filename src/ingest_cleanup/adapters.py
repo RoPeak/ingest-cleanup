@@ -173,15 +173,31 @@ def kavita_records(config: Config, category: Category) -> tuple[list[Evidence], 
         try:
             if not _safe_report_file(report, root): raise ValueError("unsafe report path")
             data = json.loads(report.read_text(encoding="utf-8"))
-            if not isinstance(data, dict) or data.get("report_schema") not in {"kavita-ingest-publication-v1", "kavita-ingest-publication-v2"}:
+            if not isinstance(data, dict) or data.get("report_schema") not in {"kavita-ingest-publication-v1", "kavita-ingest-publication-v2", "kavita-ingest-publication-v3"}:
                 raise ValueError("unsupported Kavita publication schema")
             schema = data.get("report_schema")
             accepted_lifecycle = {"preserved"} if schema == "kavita-ingest-publication-v1" else {"preserved", "mixed"}
-            if not (data.get("status") == "completed" and data.get("approved_apply") is True and data.get("source_lifecycle") in accepted_lifecycle and data.get("verification_completed") is True and not data.get("recovery_required")):
+            accepted_statuses = {"completed", "partial"} if schema == "kavita-ingest-publication-v3" else {"completed"}
+            recovery_consistent = (
+                schema == "kavita-ingest-publication-v3"
+                and data.get("status") == "partial"
+                and data.get("recovery_required") is True
+            ) or (
+                data.get("status") == "completed"
+                and not data.get("recovery_required")
+            )
+            if not (data.get("status") in accepted_statuses and recovery_consistent and data.get("approved_apply") is True and data.get("source_lifecycle") in accepted_lifecycle and data.get("verification_completed") is True):
                 raise ValueError("not a completed verified preserve-source APPLY")
             for index, item in enumerate(data.get("items", []), 1):
                 if not isinstance(item, dict): raise ValueError("invalid item")
-                if data.get("report_schema") == "kavita-ingest-publication-v2":
+                if schema == "kavita-ingest-publication-v3":
+                    state = item.get("item_state")
+                    eligible = item.get("cleanup_eligible")
+                    if state != "complete" or eligible is not True:
+                        if eligible is True:
+                            raise ValueError("incomplete item is marked cleanup eligible")
+                        continue
+                if schema in {"kavita-ingest-publication-v2", "kavita-ingest-publication-v3"}:
                     if item.get("source_lifecycle") != "preserved":
                         continue
                     if item.get("action") not in {"published", "verified-existing-duplicate"}:
