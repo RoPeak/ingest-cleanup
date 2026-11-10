@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from ingest_cleanup import cli
 from ingest_cleanup import core as core_module
+from ingest_cleanup.backup_proof import create_backup_proof, find_backup_proof
 from ingest_cleanup.config import Category, Config, kavita_xdg_state, validate
 from ingest_cleanup.core import (
     apply_deletions,
@@ -736,6 +739,328 @@ def test_malformed_repair_manifest_remains_unknown(tmp_path: Path):
     assert manifest.state == "UNKNOWN"
     assert manifest.reason_code == "REPAIR_PROVENANCE_INVALID"
     assert sidecar.exists()
+
+
+def test_explicit_supersession_resolves_mapping_but_never_proves_backup(tmp_path: Path):
+    ingest = tmp_path / "incoming"; production = tmp_path / "books"; state = tmp_path / "state"
+    archive = tmp_path / "archive"
+    for path in (ingest, production, archive, state / "kavita-reports", state / "supersession-reports"):
+        path.mkdir(parents=True)
+    source = ingest / "book.epub"; old = production / "old.epub"; new = production / "new.epub"
+    source.write_bytes(b"source"); old.write_bytes(b"old-metadata"); new.write_bytes(b"new-metadata")
+    source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    old_hash = hashlib.sha256(old.read_bytes()).hexdigest()
+    new_hash = hashlib.sha256(new.read_bytes()).hexdigest()
+    report = _kavita_report(source, old, transformed=True)
+    report["items"].append({**report["items"][0], "destination": str(new), "destination_sha256": new_hash})
+    report["items"][0]["source_sha256"] = source_hash
+    report["items"][0]["destination_sha256"] = old_hash
+    (state / "kavita-reports" / "publications.json").write_text(json.dumps(report))
+    category = Category("Books", ingest, production, "kavita")
+    config = Config((category,), (), None, True, state)
+
+    before, _ = assess_category(config, category, hash_files=False)
+    assert before[0].reason_code == "AMBIGUOUS_MAPPING"
+
+    archived = archive / "old.epub"
+    old.rename(archived)
+    supersession = {
+        "report_schema": "kavita-ingest-supersession-v1",
+        "state": "complete",
+        "items": [{
+            "source": str(source), "source_sha256": source_hash,
+            "old_destination": str(old), "old_destination_sha256": old_hash,
+            "archive": str(archived),
+            "canonical_destination": str(new), "canonical_destination_sha256": new_hash,
+        }],
+    }
+    (state / "supersession-reports" / "dcc.json").write_text(json.dumps(supersession))
+
+    status, rejected = assess_category(config, category, hash_files=False)
+    verified, _ = assess_category(config, category, hash_files=True)
+
+    assert not rejected
+    assert status[0].state == "CANDIDATE"
+    assert "ignored 1 stale provenance mapping" in status[0].reason
+    assert verified[0].state == "BACKUP_REQUIRED"
+    assert archived.is_file() and new.is_file() and source.is_file()
+
+
+def test_changed_supersession_archive_fails_closed(tmp_path: Path):
+    ingest = tmp_path / "incoming"; production = tmp_path / "books"; state = tmp_path / "state"
+    archive = tmp_path / "archive"
+    for path in (ingest, production, archive, state / "kavita-reports", state / "supersession-reports"):
+        path.mkdir(parents=True)
+    source = ingest / "book.epub"; old = production / "old.epub"; new = production / "new.epub"
+    source.write_bytes(b"source"); old.write_bytes(b"old"); new.write_bytes(b"new")
+    source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    old_hash = hashlib.sha256(old.read_bytes()).hexdigest()
+    new_hash = hashlib.sha256(new.read_bytes()).hexdigest()
+    report = _kavita_report(source, old, transformed=True)
+    report["items"].append({**report["items"][0], "destination": str(new), "destination_sha256": new_hash})
+    report["items"][0].update({"source_sha256": source_hash, "destination_sha256": old_hash})
+    (state / "kavita-reports" / "publications.json").write_text(json.dumps(report))
+    archived = archive / "old.epub"; old.rename(archived)
+    (state / "supersession-reports" / "dcc.json").write_text(json.dumps({
+        "report_schema": "kavita-ingest-supersession-v1", "state": "complete",
+        "items": [{
+            "source": str(source), "source_sha256": source_hash,
+            "old_destination": str(old), "old_destination_sha256": old_hash,
+            "archive": str(archived), "canonical_destination": str(new),
+            "canonical_destination_sha256": new_hash,
+        }],
+    }))
+    archived.write_bytes(b"tampered")
+    category = Category("Books", ingest, production, "kavita")
+
+    results, _ = assess_category(Config((category,), (), None, True, state), category)
+
+    assert results[0].state == "REVIEW"
+    assert results[0].reason_code == "SUPERSESSION_INVALID"
+
+
+def test_interrupted_archive_without_complete_supersession_remains_ambiguous(
+    tmp_path: Path,
+):
+    ingest = tmp_path / "incoming"; production = tmp_path / "books"; state = tmp_path / "state"
+    archive = tmp_path / "archive"
+    for path in (ingest, production, archive, state / "kavita-reports"):
+        path.mkdir(parents=True)
+    source = ingest / "book.epub"; old = production / "old.epub"; new = production / "new.epub"
+    source.write_bytes(b"source"); old.write_bytes(b"old"); new.write_bytes(b"new")
+    report = _kavita_report(source, old, transformed=True)
+    report["items"].append(
+        {
+            **report["items"][0],
+            "destination": str(new),
+            "destination_sha256": hashlib.sha256(new.read_bytes()).hexdigest(),
+        }
+    )
+    (state / "kavita-reports" / "publications.json").write_text(json.dumps(report))
+    old.rename(archive / "old.epub")
+    category = Category("Books", ingest, production, "kavita")
+
+    results, _ = assess_category(
+        Config((category,), (), None, True, state), category, hash_files=True
+    )
+
+    assert results[0].state == "UNKNOWN"
+    assert results[0].reason_code == "AMBIGUOUS_MAPPING"
+    assert "explicit supersession" in results[0].reason
+
+
+def test_invalid_multi_item_supersession_is_applied_transactionally(tmp_path: Path):
+    ingest = tmp_path / "incoming"; production = tmp_path / "books"; state = tmp_path / "state"
+    archive = tmp_path / "archive"
+    for path in (ingest, production, archive, state / "kavita-reports", state / "supersession-reports"):
+        path.mkdir(parents=True)
+    source = ingest / "book.epub"; old = production / "old.epub"; new = production / "new.epub"
+    source.write_bytes(b"source"); old.write_bytes(b"old"); new.write_bytes(b"new")
+    source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    old_hash = hashlib.sha256(old.read_bytes()).hexdigest()
+    new_hash = hashlib.sha256(new.read_bytes()).hexdigest()
+    report = _kavita_report(source, old, transformed=True)
+    report["items"].append(
+        {
+            **report["items"][0],
+            "destination": str(new),
+            "destination_sha256": new_hash,
+        }
+    )
+    report["items"][0].update(
+        {"source_sha256": source_hash, "destination_sha256": old_hash}
+    )
+    (state / "kavita-reports" / "publications.json").write_text(json.dumps(report))
+    archived = archive / "old.epub"; old.rename(archived)
+    valid_item = {
+        "source": str(source), "source_sha256": source_hash,
+        "old_destination": str(old), "old_destination_sha256": old_hash,
+        "archive": str(archived), "canonical_destination": str(new),
+        "canonical_destination_sha256": new_hash,
+    }
+    (state / "supersession-reports" / "partial.json").write_text(
+        json.dumps(
+            {
+                "report_schema": "kavita-ingest-supersession-v1",
+                "state": "complete",
+                "items": [valid_item, {"invalid": True}],
+            }
+        )
+    )
+    category = Category("Books", ingest, production, "kavita")
+
+    results, rejected = assess_category(
+        Config((category,), (), None, True, state), category, hash_files=False
+    )
+
+    assert rejected
+    assert results[0].reason_code == "AMBIGUOUS_MAPPING"
+
+
+def test_exact_source_backup_proof_can_authorize_transformed_publication(tmp_path: Path):
+    ingest = tmp_path / "incoming"; production = tmp_path / "books"; state = tmp_path / "state"
+    backup_mount = tmp_path / "backup"; proof_root = tmp_path / "proofs"
+    for path in (ingest, production, backup_mount, state / "kavita-reports"):
+        path.mkdir(parents=True)
+    source = ingest / "book.epub"; destination = production / "book.epub"
+    backup = backup_mount / "Incoming" / "book.epub"; backup.parent.mkdir()
+    source.write_bytes(b"original-source"); destination.write_bytes(b"rewritten-publication")
+    backup.write_bytes(source.read_bytes())
+    (state / "kavita-reports" / "publication.json").write_text(
+        json.dumps(_kavita_report(source, destination, transformed=True))
+    )
+
+    def runner(*args, **kwargs):  # type: ignore[no-untyped-def]
+        target = Path(args[0][args[0].index("--target") + 1])
+        is_backup = target.is_relative_to(backup_mount)
+        return subprocess.CompletedProcess(
+            args[0], 0, json.dumps({"filesystems": [{
+                "target": str(backup_mount if is_backup else tmp_path),
+                "source": "/dev/sdz1" if is_backup else "/dev/sda1",
+                "uuid": "MEDIA-UUID" if is_backup else "SOURCE-UUID",
+                "options": "rw",
+            }]}), ""
+        )
+
+    create_backup_proof(
+        source, destination, backup, "MEDIA-UUID", proof_root, runner=runner
+    )
+    category = Category("Books", ingest, production, "kavita")
+    config = Config((category,), (), None, True, state, proof_root)
+
+    results, _ = assess_category(config, category, hash_files=True)
+
+    assert results[0].state == "SAFE"
+    assert results[0].reason_code == "INDEPENDENT_BACKUP_VERIFIED"
+    assert results[0].evidence_identifier and results[0].evidence_identifier.endswith(".json")
+
+
+def test_transformed_publication_backup_is_not_source_backup_proof(tmp_path: Path):
+    source = tmp_path / "source.epub"; publication = tmp_path / "published.epub"
+    mount = tmp_path / "backup"; mount.mkdir()
+    backup = mount / "published.epub"
+    source.write_bytes(b"original"); publication.write_bytes(b"transformed")
+    backup.write_bytes(publication.read_bytes())
+
+    def runner(*args, **kwargs):  # type: ignore[no-untyped-def]
+        target = Path(args[0][args[0].index("--target") + 1])
+        is_backup = target.is_relative_to(mount)
+        return subprocess.CompletedProcess(
+            args[0], 0,
+            json.dumps({"filesystems": [{
+                "target": str(mount if is_backup else tmp_path),
+                "uuid": "EXPECTED" if is_backup else "SOURCE",
+            }]}),
+            "",
+        )
+
+    with pytest.raises(ValueError, match="transformed publication backup is insufficient"):
+        create_backup_proof(source, publication, backup, "EXPECTED", tmp_path / "proofs", runner=runner)
+
+
+@pytest.mark.parametrize("returncode,uuid", [(1, "EXPECTED"), (0, "WRONG")])
+def test_missing_or_wrong_backup_filesystem_identity_is_refused(
+    tmp_path: Path, returncode: int, uuid: str
+):
+    source = tmp_path / "source"; publication = tmp_path / "publication"
+    mount = tmp_path / "mount"; mount.mkdir(); backup = mount / "source"
+    source.write_bytes(b"same"); publication.write_bytes(b"same"); backup.write_bytes(b"same")
+
+    def runner(*args, **kwargs):  # type: ignore[no-untyped-def]
+        target = Path(args[0][args[0].index("--target") + 1])
+        is_backup = target.is_relative_to(mount)
+        output = json.dumps({"filesystems": [{"target": str(mount), "uuid": uuid}]})
+        if not is_backup:
+            output = json.dumps(
+                {"filesystems": [{"target": str(tmp_path), "uuid": "SOURCE"}]}
+            )
+        return subprocess.CompletedProcess(args[0], returncode, output, "")
+
+    with pytest.raises(ValueError, match="not mounted|UUID"):
+        create_backup_proof(source, publication, backup, "EXPECTED", tmp_path / "proofs", runner=runner)
+
+
+def test_stale_backup_proof_is_not_accepted_offline(tmp_path: Path):
+    source = tmp_path / "source"; publication = tmp_path / "publication"
+    mount = tmp_path / "mount"; mount.mkdir(); backup = mount / "source"
+    source.write_bytes(b"same"); publication.write_bytes(b"same"); backup.write_bytes(b"same")
+    proof_root = tmp_path / "proofs"
+
+    def runner(*args, **kwargs):  # type: ignore[no-untyped-def]
+        target = Path(args[0][args[0].index("--target") + 1])
+        is_backup = target.is_relative_to(mount)
+        output = json.dumps({"filesystems": [{
+            "target": str(mount if is_backup else tmp_path),
+            "uuid": "EXPECTED" if is_backup else "SOURCE",
+        }]})
+        return subprocess.CompletedProcess(args[0], 0, output, "")
+
+    create_backup_proof(source, publication, backup, "EXPECTED", proof_root, runner=runner)
+    source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    publication_hash = hashlib.sha256(publication.read_bytes()).hexdigest()
+    future = datetime.now(UTC) + timedelta(days=15)
+
+    proof, reason = find_backup_proof(
+        proof_root,
+        source=source.resolve(), source_sha256=source_hash,
+        publication=publication.resolve(), publication_sha256=publication_hash,
+        now=future,
+    )
+
+    assert proof is None
+    assert reason == "backup proof is stale"
+
+
+def test_backup_proof_refuses_same_filesystem_and_changed_endpoint_identity(
+    tmp_path: Path,
+):
+    source = tmp_path / "source"; publication = tmp_path / "publication"
+    mount = tmp_path / "mount"; mount.mkdir(); backup = mount / "source"
+    source.write_bytes(b"same"); publication.write_bytes(b"same"); backup.write_bytes(b"same")
+
+    def same_runner(*args, **kwargs):  # type: ignore[no-untyped-def]
+        output = json.dumps(
+            {"filesystems": [{"target": str(tmp_path), "uuid": "SAME"}]}
+        )
+        return subprocess.CompletedProcess(args[0], 0, output, "")
+
+    with pytest.raises(ValueError, match="same filesystem"):
+        create_backup_proof(
+            source, publication, backup, "SAME", tmp_path / "proofs", runner=same_runner
+        )
+
+    def independent_runner(*args, **kwargs):  # type: ignore[no-untyped-def]
+        target = Path(args[0][args[0].index("--target") + 1])
+        is_backup = target.is_relative_to(mount)
+        output = json.dumps(
+            {"filesystems": [{
+                "target": str(mount if is_backup else tmp_path),
+                "uuid": "BACKUP" if is_backup else "SOURCE",
+            }]}
+        )
+        return subprocess.CompletedProcess(args[0], 0, output, "")
+
+    proof_root = tmp_path / "proofs"
+    create_backup_proof(
+        source, publication, backup, "BACKUP", proof_root, runner=independent_runner
+    )
+    source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    publication_hash = hashlib.sha256(publication.read_bytes()).hexdigest()
+    replacement = tmp_path / "replacement"
+    replacement.write_bytes(source.read_bytes())
+    source.unlink()
+    replacement.rename(source)
+
+    proof, reason = find_backup_proof(
+        proof_root,
+        source=source.resolve(),
+        source_sha256=source_hash,
+        publication=publication.resolve(),
+        publication_sha256=publication_hash,
+    )
+
+    assert proof is None
+    assert "does not bind" in reason
 
 
 def test_apply_empty_result_uses_mode_aware_completion_message(

@@ -30,3 +30,6 @@ music_root = "/home/user/.local/state/music-ingest"
 # Set only when kavita-ingest uses a custom state database location; this is the
 # parent directory of that database, never a media library path.
 # kavita_root = "/path/to/kavita-ingest-state"
+# Private exact-source proof records default to
+# $XDG_STATE_HOME/ingest-cleanup/backup-proofs.
+# backup_proof_root = "/path/to/ingest-cleanup/backup-proofs"

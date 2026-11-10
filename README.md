@@ -76,8 +76,34 @@ backup coverage. Cleanup reports this limitation and does not infer backup
 freshness from the production copy. Kavita publications therefore stop at
 `BACKUP_REQUIRED` after fresh source/destination SHA-256 verification. They are
 excluded from saved deletion plans and `apply`, including plans created by an
-older version. Keep those Incoming files until a trustworthy independent
-per-file backup-evidence adapter exists.
+older version.
+
+An exact-source independent proof can be recorded only while the backup object is
+on a mounted filesystem whose UUID is explicitly verified:
+
+```bash
+ingest-cleanup backup-proof /path/to/Incoming/book.epub \
+  --publication /path/to/library/book.epub \
+  --backup-object /mounted/independent/backup/book.epub \
+  --expected-uuid EXPECTED_FILESYSTEM_UUID
+```
+
+The backup object's SHA-256 must equal the Incoming source, while current source
+and publication endpoint identities, publication hash and byte relationship are
+bound separately. The backup mount is identified before the object is opened and
+must not be the source filesystem. A backup of a metadata-rewritten or repaired
+publication cannot prove preservation of different original bytes. Proof records
+are private, integrity-bound, retained by timestamp, usable while the verified
+backup disk is later offline, and expire after 14 days unless reverified. Missing,
+wrong-UUID, stale, changed or unmounted evidence fails closed.
+Run `ingest-cleanup verify --verbose` to revalidate eligibility and display the
+proof-record path used for any deletion-ready source.
+
+Producer-owned `kavita-ingest-supersession-v1` reports can mark an older accepted
+publication mapping explicitly superseded while retaining its archive identity
+and hash. Cleanup then uses the still-current canonical mapping instead of
+guessing between two destinations. The archived object is rehashed during full
+verification; supersession never counts as independent backup proof.
 
 ## Development
 

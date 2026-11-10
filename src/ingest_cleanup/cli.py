@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
 
+from .backup_proof import create_backup_proof
 from .config import Config, load, validate, xdg_config
 from .core import (
     Assessment,
@@ -24,8 +26,11 @@ def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(prog="ingest-cleanup", description="Safely remove preserved ingest files only after fresh provenance verification.")
     value.add_argument("--config-file", type=Path, default=xdg_config())
     value.add_argument("--verbose", action="store_true")
-    value.add_argument("command", nargs="?", choices=("status", "verify", "show", "apply", "config", "help", "explain", "provenance-status"), default="status")
+    value.add_argument("command", nargs="?", choices=("status", "verify", "show", "apply", "config", "help", "explain", "provenance-status", "backup-proof"), default="status")
     value.add_argument("target", nargs="?", help="Incoming path for explain, or verification plan ID for show/apply")
+    value.add_argument("--publication", type=Path, help="Published destination bound to backup proof")
+    value.add_argument("--backup-object", type=Path, help="Exact source-byte object on independent storage")
+    value.add_argument("--expected-uuid", help="Expected independent backup filesystem UUID")
     return value
 
 
@@ -82,6 +87,7 @@ def _print(
     # Show every configured category: an empty Books root must not look like an
     # unsupported category.
     names = [item.name for item in categories] if categories is not None else list(grouped)
+    adapters = {item.name: item.adapter for item in categories or []}
     for category in names:
         values = grouped.get(category, [])
         counts = Counter(value.state for value in values)
@@ -93,10 +99,34 @@ def _print(
         print(f"  Review:         {counts['REVIEW']}")
         print(f"  Provenance:     {counts['PROVENANCE']}")
         print(f"  Unknown:        {counts['UNKNOWN']}")
+        if adapters.get(category) == "kavita":
+            reconciliation = sum(
+                value.reason_code == "AMBIGUOUS_MAPPING" for value in values
+            )
+            manual = sum(
+                value.state in {"REVIEW", "UNKNOWN"}
+                and value.reason_code != "AMBIGUOUS_MAPPING"
+                for value in values
+            )
+            published = (
+                counts["CANDIDATE"]
+                + counts["SAFE"]
+                + counts["BACKUP_REQUIRED"]
+                + reconciliation
+            )
+            print("  Action summary:")
+            print(f"    Published evidence:               {published}")
+            print(f"    Safe to remove:                   {counts['SAFE']}")
+            print(f"    Awaiting independent backup:      {counts['BACKUP_REQUIRED']}")
+            print(f"    Awaiting publication reconciliation: {reconciliation}")
+            print(f"    Defective/manual action:          {manual}")
+            print(f"    Retained repair provenance:       {counts['PROVENANCE']}")
         if verbose:
             for value in values:
                 mapping = f" -> {value.destination}" if value.destination else ""
                 print(f"  {value.state} [{value.reason_code or 'UNCLASSIFIED'}]: {value.source}{mapping} — {value.reason}")
+                if value.evidence_identifier:
+                    print(f"    Evidence: {value.evidence_identifier}")
         else:
             reasons = Counter((value.state, value.reason) for value in values if value.state != "SAFE")
             for (state, reason), count in sorted(reasons.items()):
@@ -113,9 +143,8 @@ def _print(
             for (origin, reason), count in sorted(
                 grouped_reports.items(), key=lambda value: (value[0][0], value[0][1])
             ):
-                print(f"  {count} from {origin} — {reason}")
+                print(f"  {count} [{_rejection_kind(reason)}] from {origin} — {reason}")
             print("  Use --verbose for the full rejected-report list.")
-    adapters = {item.name: item.adapter for item in categories or []}
     missing = Counter(value.evidence.adapter if value.evidence else adapters.get(value.category, "unknown") for value in results if value.reason_code == "NO_ACCEPTED_REPORT")
     if missing:
         commands = {"video": "video-ingest", "music": "music-ingest", "kavita": "kavita-ingest", "unknown": "the authoritative producer"}
@@ -128,6 +157,13 @@ def _print(
             f"{backup_required} verified publication(s) remain in Incoming because no "
             "independent per-file backup proof is available. They are not deletion-ready."
         )
+    reconciliation_items = [
+        value for value in results if value.reason_code == "AMBIGUOUS_MAPPING"
+    ]
+    if reconciliation_items:
+        print("Publication reconciliation is required before cleanup can select a mapping:")
+        for value in reconciliation_items:
+            print(f"  ingest-cleanup explain '{value.source}'")
     if not apply_mode:
         print("No files were deleted. Run `ingest-cleanup apply` to verify and review deletion.")
 
@@ -137,6 +173,21 @@ def _report_origin(path: Path) -> str:
         if name in path.parts:
             return name
     return str(path.parent)
+
+
+def _rejection_kind(reason: str) -> str:
+    lowered = reason.casefold()
+    if "expecting" in lowered or "json" in lowered or "decode" in lowered:
+        return "CORRUPT_REPORT"
+    if "unsupported" in lowered or "legacy" in lowered:
+        return "UNSUPPORTED_SCHEMA"
+    if "not an approved" in lowered or "did not complete" in lowered or "incomplete" in lowered:
+        return "INCOMPLETE_RUN"
+    if "missing" in lowered or "does not exist" in lowered:
+        return "MISSING_ENDPOINT"
+    if "duplicate" in lowered:
+        return "DUPLICATE_DISCOVERY"
+    return "INVALID_PROVENANCE"
 
 
 def _load(path: Path) -> Config:
@@ -207,6 +258,31 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "provenance-status":
         _provenance_status(config); return 0
+    if args.command == "backup-proof":
+        if not args.target or not args.publication or not args.backup_object or not args.expected_uuid:
+            print(
+                "ingest-cleanup backup-proof requires SOURCE --publication PATH "
+                "--backup-object PATH --expected-uuid UUID",
+                file=sys.stderr,
+            )
+            return 2
+        if config.backup_proof_root is None:
+            print("ingest-cleanup: backup proof root is not configured", file=sys.stderr)
+            return 2
+        try:
+            proof = create_backup_proof(
+                Path(args.target),
+                args.publication,
+                args.backup_object,
+                args.expected_uuid,
+                config.backup_proof_root,
+            )
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            print(f"ingest-cleanup: backup proof refused: {exc}", file=sys.stderr)
+            return 2
+        print(f"Verified exact-source independent backup proof: {proof}")
+        print("No Incoming or publication file was changed.")
+        return 0
     if args.command == "explain":
         if args.target is None:
             print("ingest-cleanup explain requires an Incoming source path", file=sys.stderr); return 2

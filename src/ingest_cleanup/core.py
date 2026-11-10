@@ -5,12 +5,13 @@ import json
 import os
 import secrets
 import stat
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Callable
 
 from .adapters import Evidence, RejectedReport, collect
+from .backup_proof import find_backup_proof
 from .config import Category, Config, xdg_state
 
 CHUNK_SIZE = 4 * 1024 * 1024
@@ -54,6 +55,7 @@ REASON_CODES = {
     "escapes configured": "UNSAFE_PATH",
     "hardlink": "UNSAFE_PATH",
     "symlink": "UNSAFE_PATH",
+    "supersession": "SUPERSESSION_INVALID",
 }
 
 
@@ -241,7 +243,32 @@ def assess_category(config: Config, category: Category, progress: Callable[[Path
             results.append(Assessment(category.name, source, None, "UNKNOWN", "insufficient proof", size=source_id.size, source_identity=source_id, reason_code="NO_ACCEPTED_REPORT")); continue
         viable_by_destination: dict[Path, Evidence] = {}
         stale: list[tuple[Evidence, str]] = []
+        supersession_error: tuple[Evidence, str] | None = None
         for evidence in evidence_list:
+            if not evidence.active:
+                archived = evidence.archived_destination
+                try:
+                    if archived is None or evidence.archived_sha256 is None:
+                        raise ValueError("supersession evidence lacks an archive endpoint")
+                    archived_id = _identity(archived)
+                    if archived_id.links != 1:
+                        raise ValueError("supersession archive has unsafe hardlink count")
+                    if hash_files:
+                        archived_hash, _ = _hash(archived, progress)
+                        if archived_hash != evidence.archived_sha256:
+                            raise ValueError("supersession archive differs from recorded hash")
+                    stale.append(
+                        (
+                            evidence,
+                            (
+                                f"explicitly superseded by {evidence.superseded_by}; "
+                                f"historical publication archived at {archived}"
+                            ),
+                        )
+                    )
+                except (OSError, ValueError) as exc:
+                    supersession_error = (evidence, f"invalid supersession evidence: {exc}")
+                continue
             reason = _mapping_viability_reason(
                 evidence,
                 source_id=source_id,
@@ -255,6 +282,40 @@ def assess_category(config: Config, category: Category, progress: Callable[[Path
                 viable_by_destination.setdefault(evidence.destination, evidence)
             else:
                 stale.append((evidence, reason))
+        if supersession_error is not None:
+            evidence, text = supersession_error
+            results.append(
+                Assessment(
+                    category.name,
+                    source,
+                    evidence.archived_destination,
+                    "REVIEW",
+                    text,
+                    evidence,
+                    source_id.size,
+                    source_id,
+                    reason_code="SUPERSESSION_INVALID",
+                )
+            )
+            continue
+        active_destinations = {
+            evidence.destination for evidence in evidence_list if evidence.active
+        }
+        if category.adapter == "kavita" and len(active_destinations) > 1:
+            text = "multiple accepted publication mappings require explicit supersession"
+            results.append(
+                Assessment(
+                    category.name,
+                    source,
+                    None,
+                    "UNKNOWN",
+                    text,
+                    size=source_id.size,
+                    source_identity=source_id,
+                    reason_code="AMBIGUOUS_MAPPING",
+                )
+            )
+            continue
         if len(viable_by_destination) > 1:
             text = "multiple currently valid source provenance mappings"; results.append(Assessment(category.name, source, None, "UNKNOWN", text, size=source_id.size, source_identity=source_id, reason_code="AMBIGUOUS_MAPPING")); continue
         if not viable_by_destination:
@@ -275,20 +336,37 @@ def assess_category(config: Config, category: Category, progress: Callable[[Path
             if not evidence.transformed and source_hash != destination_hash:
                 results.append(Assessment(category.name, source, evidence.destination, "REVIEW", "content mismatch", evidence, source_id.size, source_id, reason_code="HASH_MISMATCH")); continue
             if category.adapter == "kavita":
-                results.append(Assessment(
-                    category.name,
-                    source,
-                    evidence.destination,
-                    "BACKUP_REQUIRED",
-                    "production copy verified; independent per-file backup proof is unavailable",
-                    evidence,
-                    source_id.size,
-                    source_id,
-                    source_hash,
-                    "INDEPENDENT_BACKUP_REQUIRED",
-                    destination_id,
-                    destination_hash,
-                ))
+                proof, proof_reason = find_backup_proof(
+                    config.backup_proof_root,
+                    source=source,
+                    source_sha256=source_hash,
+                    publication=evidence.destination,
+                    publication_sha256=destination_hash,
+                )
+                if proof is not None:
+                    results.append(Assessment(
+                        category.name, source, evidence.destination, "SAFE",
+                        "production copy verified; exact Incoming bytes have recent "
+                        "independent backup proof",
+                        evidence, source_id.size, source_id, source_hash,
+                        "INDEPENDENT_BACKUP_VERIFIED", destination_id, destination_hash,
+                        str(proof.get("proof_file")),
+                    ))
+                else:
+                    results.append(Assessment(
+                        category.name,
+                        source,
+                        evidence.destination,
+                        "BACKUP_REQUIRED",
+                        f"production copy verified; {proof_reason}",
+                        evidence,
+                        source_id.size,
+                        source_id,
+                        source_hash,
+                        "INDEPENDENT_BACKUP_REQUIRED",
+                        destination_id,
+                        destination_hash,
+                    ))
             else:
                 results.append(Assessment(category.name, source, evidence.destination, "SAFE", "production copy verified", evidence, source_id.size, source_id, source_hash, "VERIFIED", destination_id, destination_hash))
         except (OSError, ValueError) as exc:
@@ -322,6 +400,7 @@ def config_fingerprint(config: Config) -> str:
         "video_state_roots": [str(p.resolve(strict=False)) for p in config.video_state_roots],
         "music_state_root": str(config.music_state_root.resolve(strict=False)) if config.music_state_root else None,
         "kavita_state_root": str(config.kavita_state_root.resolve(strict=False)) if config.kavita_state_root else None,
+        "backup_proof_root": str(config.backup_proof_root.resolve(strict=False)) if config.backup_proof_root else None,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 

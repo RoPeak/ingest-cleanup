@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import stat
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Iterable
 
 from .config import Category, Config
 
@@ -18,6 +18,10 @@ class Evidence:
     source_sha256: str | None = None
     destination_sha256: str | None = None
     transformed: bool = False
+    active: bool = True
+    archived_destination: Path | None = None
+    archived_sha256: str | None = None
+    superseded_by: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -216,7 +220,113 @@ def kavita_records(config: Config, category: Category) -> tuple[list[Evidence], 
                 records.append(Evidence(source, destination, "kavita", report, f"{report}:{index}", sh, dh, bool(item.get("transformations"))))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
             rejected.append(RejectedReport(report, str(exc)))
-    return records, rejected
+    reconciled, supersession_rejected = _apply_kavita_supersessions(
+        config, category, records
+    )
+    return reconciled, [*rejected, *supersession_rejected]
+
+
+def _apply_kavita_supersessions(
+    config: Config,
+    category: Category,
+    records: list[Evidence],
+) -> tuple[list[Evidence], list[RejectedReport]]:
+    root = config.kavita_state_root
+    if root is None:
+        return records, []
+    report_root = root / "supersession-reports"
+    if not report_root.is_dir() or report_root.is_symlink():
+        return records, []
+    output = list(records)
+    rejected: list[RejectedReport] = []
+    for report in sorted(report_root.glob("*.json")):
+        try:
+            if not _safe_report_file(report, root):
+                raise ValueError("unsafe supersession report path")
+            data = json.loads(report.read_text(encoding="utf-8"))
+            if (
+                not isinstance(data, dict)
+                or data.get("report_schema") != "kavita-ingest-supersession-v1"
+                or data.get("state") != "complete"
+            ):
+                raise ValueError("unsupported or incomplete Kavita supersession report")
+            items = data.get("items")
+            if not isinstance(items, list) or not items:
+                raise ValueError("Kavita supersession report has no items")
+            candidate = list(output)
+            for item in items:
+                if not isinstance(item, dict):
+                    raise TypeError("invalid supersession item")
+                source = _absolute_clean(item.get("source"))
+                old = _absolute_clean(item.get("old_destination"))
+                new = _absolute_clean(item.get("canonical_destination"))
+                archived = _absolute_clean(item.get("archive"))
+                hashes = (
+                    item.get("source_sha256"),
+                    item.get("old_destination_sha256"),
+                    item.get("canonical_destination_sha256"),
+                )
+                if None in {source, old, new, archived} or not all(
+                    isinstance(value, str)
+                    and len(value) == 64
+                    and all(character in "0123456789abcdef" for character in value.casefold())
+                    for value in hashes
+                ):
+                    raise ValueError("supersession item lacks safe paths or hashes")
+                assert source is not None and old is not None and new is not None
+                assert archived is not None
+                if not source.is_relative_to(category.ingest_root):
+                    continue
+                if old == new:
+                    raise ValueError("supersession old and canonical paths are identical")
+                if not old.is_relative_to(category.production_root) or not new.is_relative_to(
+                    category.production_root
+                ):
+                    raise ValueError("supersession paths do not match configured category roots")
+                if archived.is_relative_to(category.ingest_root) or archived.is_relative_to(
+                    category.production_root
+                ):
+                    raise ValueError("supersession archive is inside a monitored root")
+                _regular_endpoint(archived, "supersession archive")
+                _regular_endpoint(new, "canonical supersession destination")
+                old_matches = [
+                    index
+                    for index, value in enumerate(candidate)
+                    if value.active
+                    and value.source == source
+                    and value.destination == old
+                    and value.source_sha256 == hashes[0]
+                    and value.destination_sha256 == hashes[1]
+                ]
+                new_matches = [
+                    value
+                    for value in candidate
+                    if value.active
+                    and value.source == source
+                    and value.destination == new
+                    and value.source_sha256 == hashes[0]
+                    and value.destination_sha256 == hashes[2]
+                ]
+                if not old_matches or not new_matches:
+                    raise ValueError("supersession does not bind accepted old and new provenance")
+                for index in old_matches:
+                    candidate[index] = replace(
+                        candidate[index],
+                        active=False,
+                        archived_destination=archived,
+                        archived_sha256=str(hashes[1]),
+                        superseded_by=new,
+                    )
+            output = candidate
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+            rejected.append(RejectedReport(report, str(exc)))
+    return output, rejected
+
+
+def _regular_endpoint(path: Path, label: str) -> None:
+    value = path.lstat()
+    if not stat.S_ISREG(value.st_mode) or stat.S_ISLNK(value.st_mode) or value.st_nlink != 1:
+        raise ValueError(f"{label} is not a regular single-link file")
 
 
 def _kavita_category(config: Config, source: Path, destination: Path) -> Category:
