@@ -190,6 +190,14 @@ def kavita_records(config: Config, category: Category) -> tuple[list[Evidence], 
                 raise ValueError("not a completed verified preserve-source APPLY")
             for index, item in enumerate(data.get("items", []), 1):
                 if not isinstance(item, dict): raise ValueError("invalid item")
+                source = _absolute_clean(item.get("source"))
+                destination = _absolute_clean(item.get("destination"))
+                if source is None or destination is None:
+                    raise ValueError("item lacks safe paths")
+                routed = _kavita_category(config, source, destination)
+                _validate_reported_roots(item, routed)
+                if routed != category:
+                    continue
                 if schema == "kavita-ingest-publication-v3":
                     state = item.get("item_state")
                     eligible = item.get("cleanup_eligible")
@@ -202,16 +210,39 @@ def kavita_records(config: Config, category: Category) -> tuple[list[Evidence], 
                         continue
                     if item.get("action") not in {"published", "verified-existing-duplicate"}:
                         raise ValueError("item has unsupported action")
-                source, destination = _absolute_clean(item.get("source")), _absolute_clean(item.get("destination"))
                 sh, dh = item.get("source_sha256"), item.get("destination_sha256")
-                if source is None or destination is None or not all(isinstance(x, str) and len(x) == 64 for x in (sh, dh)):
-                    raise ValueError("item lacks safe paths or hashes")
-                if not source.is_relative_to(category.ingest_root) or not destination.is_relative_to(category.production_root):
-                    raise ValueError("item paths do not match configured category roots")
+                if not all(isinstance(x, str) and len(x) == 64 for x in (sh, dh)):
+                    raise ValueError("item lacks safe hashes")
                 records.append(Evidence(source, destination, "kavita", report, f"{report}:{index}", sh, dh, bool(item.get("transformations"))))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
             rejected.append(RejectedReport(report, str(exc)))
     return records, rejected
+
+
+def _kavita_category(config: Config, source: Path, destination: Path) -> Category:
+    categories = tuple(item for item in config.categories if item.adapter == "kavita")
+    source_matches = tuple(item for item in categories if source.is_relative_to(item.ingest_root))
+    destination_matches = tuple(
+        item for item in categories if destination.is_relative_to(item.production_root)
+    )
+    matches = tuple(item for item in source_matches if item in destination_matches)
+    if len(matches) == 1:
+        return matches[0]
+    if source_matches or destination_matches:
+        raise ValueError("item source and destination cross configured Kavita category roots")
+    raise ValueError("item paths do not match any configured Kavita category roots")
+
+
+def _validate_reported_roots(item: dict[str, object], category: Category) -> None:
+    present = {key for key in ("source_root", "library_root") if key in item}
+    if not present:
+        return
+    if present != {"source_root", "library_root"}:
+        raise ValueError("item has incomplete reported category roots")
+    source_root = _absolute_clean(item.get("source_root"))
+    library_root = _absolute_clean(item.get("library_root"))
+    if source_root != category.ingest_root or library_root != category.production_root:
+        raise ValueError("item reported roots do not match configured category roots")
 
 
 def collect(config: Config, category: Category) -> tuple[list[Evidence], list[RejectedReport]]:

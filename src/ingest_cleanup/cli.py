@@ -91,6 +91,7 @@ def _print(
         print(f"  Safe:           {counts['SAFE']}")
         print(f"  Backup needed:  {counts['BACKUP_REQUIRED']}")
         print(f"  Review:         {counts['REVIEW']}")
+        print(f"  Provenance:     {counts['PROVENANCE']}")
         print(f"  Unknown:        {counts['UNKNOWN']}")
         if verbose:
             for value in values:
@@ -102,10 +103,18 @@ def _print(
                 code = next((value.reason_code for value in values if value.state == state and value.reason == reason), "UNCLASSIFIED")
                 print(f"  {state} [{code}]: {count} — {reason}")
         print()
-    if rejected and verbose:
+    if rejected:
         print(f"Ignored corrupt/unsafe reports: {len(rejected)}")
-        for item in rejected:
-            print(f"  REPORT_REJECTED: {item.path} — {item.reason}")
+        if verbose:
+            for item in rejected:
+                print(f"  REPORT_REJECTED: {item.path} — {item.reason}")
+        else:
+            grouped_reports = Counter((_report_origin(item.path), item.reason) for item in rejected)
+            for (origin, reason), count in sorted(
+                grouped_reports.items(), key=lambda value: (value[0][0], value[0][1])
+            ):
+                print(f"  {count} from {origin} — {reason}")
+            print("  Use --verbose for the full rejected-report list.")
     adapters = {item.name: item.adapter for item in categories or []}
     missing = Counter(value.evidence.adapter if value.evidence else adapters.get(value.category, "unknown") for value in results if value.reason_code == "NO_ACCEPTED_REPORT")
     if missing:
@@ -121,6 +130,13 @@ def _print(
         )
     if not apply_mode:
         print("No files were deleted. Run `ingest-cleanup apply` to verify and review deletion.")
+
+
+def _report_origin(path: Path) -> str:
+    for name in ("video-ingest", "music-ingest", "kavita-ingest"):
+        if name in path.parts:
+            return name
+    return str(path.parent)
 
 
 def _load(path: Path) -> Config:

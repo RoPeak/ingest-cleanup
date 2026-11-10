@@ -11,6 +11,7 @@ from ingest_cleanup import core as core_module
 from ingest_cleanup.config import Category, Config, kavita_xdg_state, validate
 from ingest_cleanup.core import (
     apply_deletions,
+    assess,
     assess_category,
     create_verification_plan,
     load_verification_plan,
@@ -600,6 +601,141 @@ def test_kavita_v2_mixed_lifecycle_accepts_only_preserved_item(tmp_path: Path):
     assert not rejected
     assert next(value for value in results if value.source == preserved).state == "BACKUP_REQUIRED"
     assert next(value for value in results if value.source == removed).state == "UNKNOWN"
+
+
+def test_kavita_report_is_routed_to_one_configured_category_without_false_rejection(
+    tmp_path: Path,
+):
+    books_in = tmp_path / "incoming-books"; books_out = tmp_path / "books"
+    comics_in = tmp_path / "incoming-comics"; comics_out = tmp_path / "comics"
+    state = tmp_path / "state"
+    for path in (books_in, books_out, comics_in, comics_out, state / "kavita-reports"):
+        path.mkdir(parents=True)
+    source = books_in / "book.epub"; destination = books_out / "book.epub"
+    source.write_bytes(b"book"); destination.write_bytes(b"book")
+    report = _kavita_report(source, destination)
+    report["report_schema"] = "kavita-ingest-publication-v3"
+    report["items"][0].update({
+        "item_state": "complete", "cleanup_eligible": True,
+        "source_lifecycle": "preserved", "action": "published",
+        "source_root": str(books_in), "library_root": str(books_out),
+    })
+    (state / "kavita-reports" / "books.json").write_text(json.dumps(report))
+    config = Config(
+        (
+            Category("Books", books_in, books_out, "kavita"),
+            Category("Comics", comics_in, comics_out, "kavita"),
+        ),
+        (), None, True, state,
+    )
+
+    results, rejected = assess(config)
+
+    assert not rejected
+    assert [(item.category, item.state) for item in results] == [
+        ("Books", "BACKUP_REQUIRED")
+    ]
+
+
+def test_kavita_cross_category_report_is_rejected_once(tmp_path: Path):
+    books_in = tmp_path / "incoming-books"; books_out = tmp_path / "books"
+    comics_in = tmp_path / "incoming-comics"; comics_out = tmp_path / "comics"
+    state = tmp_path / "state"
+    for path in (books_in, books_out, comics_in, comics_out, state / "kavita-reports"):
+        path.mkdir(parents=True)
+    source = books_in / "book.epub"; destination = comics_out / "book.epub"
+    source.write_bytes(b"book"); destination.write_bytes(b"book")
+    (state / "kavita-reports" / "crossed.json").write_text(
+        json.dumps(_kavita_report(source, destination))
+    )
+    config = Config(
+        (
+            Category("Books", books_in, books_out, "kavita"),
+            Category("Comics", comics_in, comics_out, "kavita"),
+        ),
+        (), None, True, state,
+    )
+
+    results, rejected = assess(config)
+
+    assert len(rejected) == 1
+    assert "cross configured Kavita category roots" in rejected[0].reason
+    assert next(item for item in results if item.source == source).state == "UNKNOWN"
+
+
+def test_unsupported_historical_kavita_report_is_deduplicated_and_summarized(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    books_in = tmp_path / "incoming-books"; books_out = tmp_path / "books"
+    comics_in = tmp_path / "incoming-comics"; comics_out = tmp_path / "comics"
+    state = tmp_path / "state"
+    for path in (books_in, books_out, comics_in, comics_out, state / "kavita-reports"):
+        path.mkdir(parents=True)
+    (state / "kavita-reports" / "legacy.json").write_text(
+        json.dumps({"report_schema": "unsupported-historical-v0"})
+    )
+    config = Config(
+        (
+            Category("Books", books_in, books_out, "kavita"),
+            Category("Comics", comics_in, comics_out, "kavita"),
+        ),
+        (), None, True, state,
+    )
+    results, rejected = assess(config)
+
+    assert len(rejected) == 1
+    cli._print(results, rejected, False, config.categories)
+    output = capsys.readouterr().out
+    assert "Ignored corrupt/unsafe reports: 1" in output
+    assert "unsupported Kavita publication schema" in output
+    assert "Use --verbose for the full rejected-report list." in output
+    assert "legacy.json" not in output
+
+
+def test_epub_repair_manifest_is_known_retained_provenance(tmp_path: Path):
+    ingest = tmp_path / "incoming"; production = tmp_path / "books"; state = tmp_path / "state"
+    ingest.mkdir(); production.mkdir(); (state / "kavita-reports").mkdir(parents=True)
+    source = ingest / "original.epub"; output = ingest / "repaired.epub"
+    source.write_bytes(b"original"); output.write_bytes(b"repaired")
+    sidecar = ingest / "repaired.epub.repair.json"
+    sidecar.write_text(json.dumps({
+        "report_schema": "kavita-ingest-epub-repair-v1",
+        "source": str(source),
+        "output": str(output),
+        "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "output_sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
+        "package_path": "OEBPS/content.opf",
+        "report": "synthetic repair",
+        "source_findings": ["mimetype_not_first"],
+        "member_hashes": {},
+    }))
+    category = Category("Books", ingest, production, "kavita")
+
+    results, rejected = assess_category(
+        Config((category,), (), None, True, state), category, hash_files=True
+    )
+
+    assert not rejected
+    manifest = next(item for item in results if item.source == sidecar)
+    assert manifest.state == "PROVENANCE"
+    assert manifest.reason_code == "REPAIR_PROVENANCE"
+    assert manifest.destination == output
+    assert source.exists() and output.exists() and sidecar.exists()
+
+
+def test_malformed_repair_manifest_remains_unknown(tmp_path: Path):
+    ingest = tmp_path / "incoming"; production = tmp_path / "books"; state = tmp_path / "state"
+    ingest.mkdir(); production.mkdir(); state.mkdir()
+    sidecar = ingest / "repaired.epub.repair.json"
+    sidecar.write_text(json.dumps({"report_schema": "wrong"}))
+    category = Category("Books", ingest, production, "kavita")
+
+    results, _ = assess_category(Config((category,), (), None, True, state), category)
+
+    manifest = next(item for item in results if item.source == sidecar)
+    assert manifest.state == "UNKNOWN"
+    assert manifest.reason_code == "REPAIR_PROVENANCE_INVALID"
+    assert sidecar.exists()
 
 
 def test_apply_empty_result_uses_mode_aware_completion_message(

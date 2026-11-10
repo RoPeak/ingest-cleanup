@@ -149,6 +149,68 @@ def _files(root: Path):
             yield candidate
 
 
+def _repair_manifest(
+    category: Category,
+    path: Path,
+    identity: Identity,
+    progress: Callable[[Path, int, int], None] | None,
+    *,
+    hash_files: bool,
+) -> Assessment | None:
+    if category.adapter != "kavita" or not path.name.casefold().endswith(".repair.json"):
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or payload.get("report_schema") != "kavita-ingest-epub-repair-v1":
+            raise ValueError("unsupported repair provenance schema")
+        source = Path(str(payload.get("source")))
+        output = Path(str(payload.get("output")))
+        expected_output = path.with_name(path.name[: -len(".repair.json")])
+        if (
+            not source.is_absolute()
+            or not output.is_absolute()
+            or not _inside(source, category.ingest_root)
+            or not _inside(output, category.ingest_root)
+            or output != expected_output
+        ):
+            raise ValueError("repair provenance paths are inconsistent or unsafe")
+        source_hash = payload.get("source_sha256")
+        output_hash = payload.get("output_sha256")
+        if not all(
+            isinstance(value, str)
+            and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value.casefold())
+            for value in (source_hash, output_hash)
+        ):
+            raise ValueError("repair provenance hashes are invalid")
+        if hash_files:
+            actual_source, _ = _hash(source, progress)
+            actual_output, _ = _hash(output, progress)
+            if actual_source != source_hash or actual_output != output_hash:
+                raise ValueError("repair provenance endpoint differs from recorded hash")
+        return Assessment(
+            category.name,
+            path,
+            output,
+            "PROVENANCE",
+            "retained EPUB repair provenance manifest; never deletion-ready",
+            size=identity.size,
+            source_identity=identity,
+            reason_code="REPAIR_PROVENANCE",
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        return Assessment(
+            category.name,
+            path,
+            None,
+            "UNKNOWN",
+            f"invalid repair provenance: {exc}",
+            size=identity.size,
+            source_identity=identity,
+            reason_code="REPAIR_PROVENANCE_INVALID",
+        )
+
+
 def assess_category(config: Config, category: Category, progress: Callable[[Path, int, int], None] | None = None, *, hash_files: bool = True) -> tuple[list[Assessment], list[RejectedReport]]:
     records, rejected = collect(config, category)
     by_source: dict[Path, list[Evidence]] = {}
@@ -164,6 +226,16 @@ def assess_category(config: Config, category: Category, progress: Callable[[Path
             if source_id.links != 1: raise ValueError("source has hardlink count other than one")
         except (OSError, ValueError) as exc:
             text = str(exc); results.append(Assessment(category.name, source, None, "UNKNOWN", text, reason_code=reason_code(text))); continue
+        repair = _repair_manifest(
+            category,
+            source,
+            source_id,
+            progress,
+            hash_files=hash_files,
+        )
+        if repair is not None:
+            results.append(repair)
+            continue
         evidence_list = by_source.get(source)
         if not evidence_list:
             results.append(Assessment(category.name, source, None, "UNKNOWN", "insufficient proof", size=source_id.size, source_identity=source_id, reason_code="NO_ACCEPTED_REPORT")); continue
@@ -229,7 +301,8 @@ def assess(config: Config, progress: Callable[[Path, int, int], None] | None = N
     for category in config.categories:
         outcome, bad = assess_category(config, category, progress, hash_files=hash_files)
         outcomes.extend(outcome); rejected.extend(bad)
-    return outcomes, rejected
+    unique_rejected = list({(item.path, item.reason): item for item in rejected}.values())
+    return outcomes, unique_rejected
 
 
 def _prune_empty(source: Path, root: Path) -> list[str]:
