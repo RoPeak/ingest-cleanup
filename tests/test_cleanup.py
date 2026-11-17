@@ -4,6 +4,7 @@ import hashlib
 import json
 import subprocess
 from datetime import UTC, datetime, timedelta
+from io import StringIO
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,9 @@ from ingest_cleanup.core import (
     verify_saved_plan,
     write_audit,
 )
+from ingest_cleanup.progress import ProgressDisplay
+from ingest_cleanup.provenance import machine_instance_id
+from ingest_cleanup.reconciliation import reconcile
 
 
 def setup(tmp_path: Path):
@@ -34,6 +38,34 @@ def video(path: Path, source: Path, destination: Path, *, mode="apply", copy=Tru
     rows = [{"type":"header","mode":mode,"copy":copy,"version":1}, {"type":"operation","source":str(source),"destination":str(destination),"media_type":"tv","metadata":{}}]
     if final: rows.append({"type":"final","operations":1})
     path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+
+
+def test_v4_video_report_is_machine_bound(tmp_path: Path):
+    ingest, production, state, category, config = setup(tmp_path)
+    source = ingest / "episode.mkv"; destination = production / "episode.mkv"
+    source.write_bytes(b"same"); destination.write_bytes(b"same")
+    report = state / "run" / "reports" / "v4.json"
+    header = {
+        "type": "header", "mode": "apply", "copy": True, "version": 4,
+        "report_schema": "video-ingest-publication-v4", "producer": "video-ingest",
+        "producer_version": "0.1.0", "producer_instance_id": machine_instance_id(),
+    }
+    operation = {
+        "type": "operation", "source": str(source), "destination": str(destination),
+        "media_type": "tv", "metadata": {}, "action": "published",
+        "source_lifecycle": "preserved", "verification": "destination-created",
+    }
+    final = {"type": "final", "operations": 1, "status": "completed"}
+    report.write_text("\n".join(json.dumps(row) for row in (header, operation, final)) + "\n")
+
+    accepted, rejected = assess_category(config, category)
+    assert not rejected and accepted[0].state == "SAFE"
+
+    header["producer_instance_id"] = "0" * 64
+    report.write_text("\n".join(json.dumps(row) for row in (header, operation, final)) + "\n")
+    accepted, rejected = assess_category(config, category)
+    assert accepted[0].reason_code == "NO_ACCEPTED_REPORT"
+    assert any("different machine" in item.reason for item in rejected)
 
 
 def test_success_and_conflict_destination(tmp_path: Path):
@@ -334,6 +366,39 @@ def test_kavita_v3_never_accepts_incomplete_item_marked_eligible(tmp_path: Path)
     assert next(item for item in items if item.source == source).reason_code == "NO_ACCEPTED_REPORT"
 
 
+def test_kavita_v4_report_is_machine_bound(tmp_path: Path):
+    ingest = tmp_path / "incoming"; production = tmp_path / "books"; state = tmp_path / "state"
+    ingest.mkdir(); production.mkdir(); (state / "kavita-reports").mkdir(parents=True)
+    source = ingest / "book.epub"; destination = production / "book.epub"
+    source.write_bytes(b"same"); destination.write_bytes(b"same")
+    payload = _kavita_report(source, destination)
+    payload.update({
+        "report_schema": "kavita-ingest-publication-v4",
+        "producer": "kavita-ingest",
+        "producer_version": "1.1.0",
+        "producer_instance_id": machine_instance_id(),
+    })
+    payload["items"][0].update({  # type: ignore[index,union-attr]
+        "item_state": "complete",
+        "cleanup_eligible": True,
+        "source_lifecycle": "preserved",
+        "action": "published",
+    })
+    report = state / "kavita-reports" / "v4.json"
+    report.write_text(json.dumps(payload))
+    category = Category("Books", ingest, production, "kavita")
+    config = Config((category,), (), None, True, state)
+
+    accepted, rejected = assess_category(config, category)
+    assert not rejected and accepted[0].state == "BACKUP_REQUIRED"
+
+    payload["producer_instance_id"] = "0" * 64
+    report.write_text(json.dumps(payload))
+    accepted, rejected = assess_category(config, category)
+    assert accepted[0].reason_code == "NO_ACCEPTED_REPORT"
+    assert any("different machine" in item.reason for item in rejected)
+
+
 def test_saved_plan_expiry_config_drift_and_endpoint_replacement_fail_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
     ingest, production, state, category, config = setup(tmp_path)
@@ -481,6 +546,31 @@ def test_music_apply_chain_and_dry_run(tmp_path: Path):
     items, bad = assess_category(config, category); assert not bad and items[0].state == "SAFE"
     data["mode"] = "dry-run"; (state / "reports" / "music.json").write_text(json.dumps(data))
     items, bad = assess_category(config, category); assert items[0].state == "UNKNOWN" and bad
+
+
+def test_music_v3_report_is_machine_bound(tmp_path: Path):
+    ingest = tmp_path / "ingest"; production = tmp_path / "production"; state = tmp_path / "state"
+    ingest.mkdir(); production.mkdir(); (state / "reports").mkdir(parents=True)
+    source = ingest / "track.flac"; destination = production / "track.flac"
+    source.write_bytes(b"music"); destination.write_bytes(b"music")
+    report = {
+        "report_schema": "music-ingest-publication-v3",
+        "producer": "music-ingest", "producer_version": "0.2.0",
+        "producer_instance_id": machine_instance_id(),
+        "mode": "apply", "approved_to_publish": True, "publication": "copy",
+        "source_lifecycle": "preserved", "publication_completed": True,
+        "source_root": str(ingest), "library_root": str(production),
+        "items": [{"kind": "audio", "action": "published", "source_lifecycle": "preserved", "source": str(source), "destination": str(destination)}],
+    }
+    path = state / "reports" / "music.json"; path.write_text(json.dumps(report))
+    category = Category("Music", ingest, production, "music")
+    config = Config((category,), (), state, False)
+    items, rejected = assess_category(config, category)
+    assert not rejected and items[0].state == "SAFE"
+    report["producer_instance_id"] = "0" * 64; path.write_text(json.dumps(report))
+    items, rejected = assess_category(config, category)
+    assert items[0].reason_code == "NO_ACCEPTED_REPORT"
+    assert any("different machine" in item.reason for item in rejected)
 
 
 def music_report(ingest: Path, production: Path, source: str, destination: str) -> dict[str, object]:
@@ -935,6 +1025,51 @@ def test_exact_source_backup_proof_can_authorize_transformed_publication(tmp_pat
     assert results[0].evidence_identifier and results[0].evidence_identifier.endswith(".json")
 
 
+def test_saved_kavita_plan_revalidates_current_backup_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
+    ingest = tmp_path / "incoming"; production = tmp_path / "books"
+    backup_mount = tmp_path / "backup"; proof_root = tmp_path / "proofs"
+    state = tmp_path / "state"
+    for path in (ingest, production, backup_mount, state / "kavita-reports"):
+        path.mkdir(parents=True)
+    source = ingest / "book.epub"; destination = production / "book.epub"
+    backup = backup_mount / "Incoming" / "book.epub"; backup.parent.mkdir()
+    source.write_bytes(b"original"); destination.write_bytes(b"transformed")
+    backup.write_bytes(source.read_bytes())
+    (state / "kavita-reports" / "publication.json").write_text(
+        json.dumps(_kavita_report(source, destination, transformed=True))
+    )
+
+    def runner(*args, **kwargs):  # type: ignore[no-untyped-def]
+        target = Path(args[0][args[0].index("--target") + 1])
+        is_backup = target.is_relative_to(backup_mount)
+        return subprocess.CompletedProcess(
+            args[0], 0, json.dumps({"filesystems": [{
+                "target": str(backup_mount if is_backup else tmp_path),
+                "source": "/dev/sdz1" if is_backup else "/dev/sda1",
+                "uuid": "MEDIA-UUID" if is_backup else "SOURCE-UUID",
+                "options": "rw",
+            }]}), ""
+        )
+
+    create_backup_proof(
+        source, destination, backup, "MEDIA-UUID", proof_root, runner=runner
+    )
+    category = Category("Books", ingest, production, "kavita")
+    config = Config((category,), (), None, True, state, proof_root)
+    assessed, _ = assess_category(config, category, hash_files=True)
+    plan_id, _ = create_verification_plan(config, assessed)
+    payload, _ = load_verification_plan(config, plan_id)
+
+    reverified = verify_saved_plan(config, payload)
+
+    assert reverified[0].state == "SAFE"
+    assert reverified[0].reason_code == "INDEPENDENT_BACKUP_VERIFIED"
+    assert reverified[0].evidence_identifier
+
+
 def test_transformed_publication_backup_is_not_source_backup_proof(tmp_path: Path):
     source = tmp_path / "source.epub"; publication = tmp_path / "published.epub"
     mount = tmp_path / "backup"; mount.mkdir()
@@ -1125,3 +1260,80 @@ def test_saved_plan_cli_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     payload = json.loads(audit.read_text())
     assert payload["status"] == "completed"
     assert payload["items"][0]["result"] == "deleted"
+
+
+def test_status_json_is_parseable_and_versioned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    ingest, production, state, category, config = setup(tmp_path)
+    (ingest / "unknown.mkv").write_bytes(b"x")
+    monkeypatch.setattr(cli, "_load", lambda path: config)
+
+    assert cli.main(["--json", "status"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["schema"] == "ingest-cleanup-output-v1"
+    assert payload["command"] == "status"
+    assert payload["summary"]["TV"]["UNKNOWN"] == 1
+
+
+def test_reconciliation_is_advisory_and_lists_competing_mappings(tmp_path: Path):
+    ingest, production, state, category, config = setup(tmp_path)
+    missing = ingest / "Absolute Batman 01 The Zoo.cbz"
+    plausible = production / "Absolute Batman Vol 1 The Zoo.cbz"
+    missing.write_bytes(b"comic"); plausible.write_bytes(b"comic")
+    ambiguous = ingest / "episode.mkv"; ambiguous.write_bytes(b"episode")
+    first = production / "Show" / "episode.mkv"; first.parent.mkdir(); first.write_bytes(b"episode")
+    second = production / "Show (2026)" / "episode.mkv"; second.parent.mkdir(); second.write_bytes(b"episode")
+    video(state / "run" / "reports" / "one.json", ambiguous, first)
+    video(state / "run" / "reports" / "two.json", ambiguous, second)
+
+    items, _ = reconcile(config)
+
+    missing_item = next(item for item in items if item.source == missing)
+    ambiguous_item = next(item for item in items if item.source == ambiguous)
+    assert missing_item.plausible_matches[0].classification == "PLAUSIBLE_ONLY"
+    assert missing_item.plausible_matches[0].destination == plausible
+    assert len(ambiguous_item.accepted_mappings) == 2
+    assert ambiguous_item.current_state == "UNKNOWN"
+
+
+class _TTYBuffer(StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+def test_progress_uses_one_tty_line_and_rate_limited_log(tmp_path: Path):
+    path = tmp_path / "large.bin"
+    tty = _TTYBuffer(); display = ProgressDisplay(stream=tty, expected_bytes=100)
+    display.set_phase("Hashing")
+    display(path, 50, 100); display(path, 100, 100); display.finish()
+    assert "\r\x1b[2KHashing" in tty.getvalue()
+    assert tty.getvalue().count("\n") == 1
+
+    log = StringIO(); display = ProgressDisplay(stream=log, interval=3600)
+    display.set_phase("Hashing")
+    display(path, 10, 100); display(path, 20, 100); display(path, 30, 100); display.finish()
+    assert log.getvalue().count("Hashing |") <= 2
+    assert "Hashing..." in log.getvalue()
+
+
+def test_apply_reuses_fresh_hashes_only_after_identity_and_report_revalidation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    ingest, production, state, category, config = setup(tmp_path)
+    source = ingest / "source.mkv"; destination = production / "destination.mkv"
+    source.write_bytes(b"same"); destination.write_bytes(b"same")
+    video(state / "run" / "reports" / "report.json", source, destination)
+    assessed, _ = assess_category(config, category)
+    monkeypatch.setattr(core_module, "_hash", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected rehash")))
+
+    payload = apply_deletions(
+        assessed,
+        {category.name: category.ingest_root},
+        tmp_path / "audit.json",
+        config=config,
+    )
+
+    assert payload["status"] == "completed"
+    assert not source.exists() and destination.exists()

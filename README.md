@@ -31,6 +31,9 @@ overlap. Keep the real configuration out of version control.
 ```bash
 ingest-cleanup config  # show the effective configured roots
 ingest-cleanup status  # read-only provenance, existence, and size assessment
+ingest-cleanup status --json
+ingest-cleanup reconcile Comics  # advisory filename/size suggestions only
+ingest-cleanup compatibility --json
 ingest-cleanup verify  # SHA-256 verification; saves a private 24-hour plan
 ingest-cleanup show PLAN_ID
 ingest-cleanup apply PLAN_ID
@@ -41,14 +44,25 @@ ingest-cleanup apply   # backwards-compatible one-shot verify/review/apply
 or library files; it writes an immutable, owner-only `verification-plan-v1`
 under `$XDG_STATE_HOME/ingest-cleanup/plans/`. Plans expire after 24 hours and
 are bound to the effective configuration, endpoint identities, hashes, sizes,
-categories, and evidence identifiers. `apply PLAN_ID` fully rehashes the plan,
-while bare `apply` retains the one-shot workflow.
+categories, and evidence identifiers. `apply PLAN_ID` fully rehashes the saved
+plan, while bare `apply` retains the one-shot workflow.
 
-Before deletion, `apply` rehashes the entire batch again, shows human-readable
-and per-category totals, and requires `DELETE <count> VERIFIED SOURCES`. It
+After typed confirmation, `apply` safely reuses the just-computed hashes only
+when source and destination device, inode, size, mtime, ctime and link count are
+unchanged, the exact producer record is still accepted, and any required Kavita
+backup proof is still current. It rechecks endpoint identity again immediately
+before unlink. This avoids an unnecessary third full read without carrying a
+hash across a changed filesystem or evidence boundary. Library and Incoming
+changes fail closed. The command shows human-readable per-category totals and
+requires `DELETE <count> VERIFIED SOURCES`. It
 creates a crash-safe audit before deletion and atomically updates it after each
 item under `$XDG_STATE_HOME/ingest-cleanup/reports/` (or
 `~/.local/state/ingest-cleanup/reports/`).
+
+`reconcile` is a read-only historical aid. It lists every competing accepted
+mapping together and can rank extension-compatible filename/size candidates,
+but inferred entries are always labelled `PLAUSIBLE_ONLY`. They cannot become
+accepted evidence, enter a verification plan, or authorize deletion.
 
 The tool never treats its own audit reports as ingestion evidence. Missing,
 ambiguous, changed, symlinked, hard-linked, or otherwise unsafe files are left
@@ -60,16 +74,27 @@ provenance only: `status` remains non-destructive and `verify`/`apply` always
 recompute both hashes before a source can become deletion-ready. User-skipped
 or non-identical conflicts are never accepted as cleanup evidence.
 
-JSONL v3 also supports mixed MOVE reports: only per-operation records whose
+Video JSONL v3 also supports mixed MOVE reports: only per-operation records whose
 `source_lifecycle` is `preserved` are eligible, so moved sources remain excluded
 while SHA-256-verified existing duplicates retain usable evidence. Legacy
 Kavita publication v3 may also represent a partial producer run: only entries
 with `item_state=complete` and `cleanup_eligible=true` are consumed. Failed,
 blocked, and uncertain siblings provide no evidence but do not invalidate an
-independently completed item. Video, music, and Kavita v1/v2 schemas remain
-readable. Unknown versions and
-incomplete reports fail closed. Historical sources become eligible only after
-replaying their authoritative producer; cleanup never guesses a destination.
+independently completed item. Known video JSONL v1-v3, music v1-v2 and Kavita
+v1-v3 schemas remain readable only from explicitly configured local state roots.
+New `video-ingest-publication-v4`, `music-ingest-publication-v3`, and
+`kavita-ingest-publication-v4` reports identify producer version and a stable,
+non-secret machine instance; cleanup refuses them on another machine. Unknown
+versions and incomplete reports fail closed. Historical sources become eligible
+only after replaying their authoritative producer; cleanup never guesses a
+destination.
+
+`--json` emits versioned result objects for status, verify, show, explain,
+reconcile, provenance status, configuration, compatibility and apply. Progress
+is sent separately to stderr. Interactive terminals use one updating line;
+redirected logs receive rate-limited newline updates. Phase labels distinguish
+scanning, hashing, backup verification and deletion revalidation. Use
+`--verbose` to include individual paths.
 
 Byte identity with production proves publication equality, not independent
 backup coverage. Cleanup reports this limitation and does not infer backup

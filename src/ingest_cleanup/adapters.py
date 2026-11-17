@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .config import Category, Config
+from .provenance import require_local_producer
 
 
 @dataclass(frozen=True)
@@ -61,8 +62,12 @@ def video_records(config: Config, category: Category) -> tuple[list[Evidence], l
                     raise ValueError("not a successful JSON Lines report")
                 header = rows[0]
                 version = header.get("version")
-                if version not in {1, 2, 3} or header.get("type") != "header" or header.get("mode") != "apply":
+                if version not in {1, 2, 3, 4} or header.get("type") != "header" or header.get("mode") != "apply":
                     raise ValueError("not a successful APPLY JSON Lines report")
+                if version == 4:
+                    if header.get("report_schema") != "video-ingest-publication-v4":
+                        raise ValueError("unsupported video publication schema")
+                    require_local_producer(header, "video-ingest")
                 if version < 3 and header.get("copy") is not True:
                     raise ValueError("legacy report is not a successful COPY report")
                 if not isinstance(rows[-1], dict) or rows[-1].get("type") != "final" or (version >= 3 and rows[-1].get("status") != "completed"):
@@ -112,8 +117,10 @@ def music_records(config: Config, category: Category) -> tuple[list[Evidence], l
             data = json.loads(report.read_text(encoding="utf-8"))
             if not isinstance(data, dict): raise ValueError("report is not an object")
             schema = data.get("report_schema")
-            if schema not in {"music-ingest-publication-v1", "music-ingest-publication-v2"}:
+            if schema not in {"music-ingest-publication-v1", "music-ingest-publication-v2", "music-ingest-publication-v3"}:
                 raise ValueError("unsupported music publication schema")
+            if schema == "music-ingest-publication-v3":
+                require_local_producer(data, "music-ingest")
             if not (data.get("mode") == "apply" and data.get("approved_to_publish") is True
                     and data.get("publication") == "copy" and data.get("source_lifecycle") == "preserved"):
                 raise ValueError("not an approved preserved APPLY publication")
@@ -123,25 +130,25 @@ def music_records(config: Config, category: Category) -> tuple[list[Evidence], l
             library_root = _absolute_clean(data.get("library_root"))
             if source_root is None or library_root is None or source_root != category.ingest_root or library_root != category.production_root:
                 raise ValueError("report roots do not match configured roots")
-            if schema == "music-ingest-publication-v2":
+            if schema in {"music-ingest-publication-v2", "music-ingest-publication-v3"}:
                 items = data.get("items")
                 if not isinstance(items, list):
                     raise ValueError("v2 report lacks per-file outcomes")
                 for index, item in enumerate(items, 1):
-                    if not isinstance(item, dict): raise ValueError("invalid v2 item")
+                    if not isinstance(item, dict): raise ValueError("invalid v2/v3 item")
                     action = item.get("action")
                     lifecycle = item.get("source_lifecycle")
                     kind = item.get("kind")
                     if action in {"failed", "conflicting", "generated-auxiliary"}:
                         continue
                     if action not in {"published", "verified-existing-duplicate"} or lifecycle != "preserved" or kind not in {"audio", "local-artwork"}:
-                        raise ValueError("v2 item has unsupported cleanup evidence")
+                        raise ValueError("v2/v3 item has unsupported cleanup evidence")
                     source_path = _absolute_clean(item.get("source")); final_destination = _absolute_clean(item.get("destination"))
                     if source_path is None or final_destination is None or not source_path.is_relative_to(source_root) or not final_destination.is_relative_to(library_root):
-                        raise ValueError("v2 item paths are unsafe")
+                        raise ValueError("v2/v3 item paths are unsafe")
                     sh, dh = item.get("source_sha256"), item.get("destination_sha256")
                     for value in (sh, dh):
-                        if value is not None and (not isinstance(value, str) or len(value) != 64): raise ValueError("v2 item has invalid hash")
+                        if value is not None and (not isinstance(value, str) or len(value) != 64): raise ValueError("v2/v3 item has invalid hash")
                     records.append(Evidence(source_path, final_destination, "music", report, f"{report}:{index}", sh, dh))
                 continue
             tracks = [track for album in data.get("albums", []) if isinstance(album, dict) for track in album.get("tracks", []) if isinstance(track, dict)]
@@ -177,13 +184,15 @@ def kavita_records(config: Config, category: Category) -> tuple[list[Evidence], 
         try:
             if not _safe_report_file(report, root): raise ValueError("unsafe report path")
             data = json.loads(report.read_text(encoding="utf-8"))
-            if not isinstance(data, dict) or data.get("report_schema") not in {"kavita-ingest-publication-v1", "kavita-ingest-publication-v2", "kavita-ingest-publication-v3"}:
+            if not isinstance(data, dict) or data.get("report_schema") not in {"kavita-ingest-publication-v1", "kavita-ingest-publication-v2", "kavita-ingest-publication-v3", "kavita-ingest-publication-v4"}:
                 raise ValueError("unsupported Kavita publication schema")
             schema = data.get("report_schema")
+            if schema == "kavita-ingest-publication-v4":
+                require_local_producer(data, "kavita-ingest")
             accepted_lifecycle = {"preserved"} if schema == "kavita-ingest-publication-v1" else {"preserved", "mixed"}
-            accepted_statuses = {"completed", "partial"} if schema == "kavita-ingest-publication-v3" else {"completed"}
+            accepted_statuses = {"completed", "partial"} if schema in {"kavita-ingest-publication-v3", "kavita-ingest-publication-v4"} else {"completed"}
             recovery_consistent = (
-                schema == "kavita-ingest-publication-v3"
+                schema in {"kavita-ingest-publication-v3", "kavita-ingest-publication-v4"}
                 and data.get("status") == "partial"
                 and data.get("recovery_required") is True
             ) or (
@@ -202,14 +211,14 @@ def kavita_records(config: Config, category: Category) -> tuple[list[Evidence], 
                 _validate_reported_roots(item, routed)
                 if routed != category:
                     continue
-                if schema == "kavita-ingest-publication-v3":
+                if schema in {"kavita-ingest-publication-v3", "kavita-ingest-publication-v4"}:
                     state = item.get("item_state")
                     eligible = item.get("cleanup_eligible")
                     if state != "complete" or eligible is not True:
                         if eligible is True:
                             raise ValueError("incomplete item is marked cleanup eligible")
                         continue
-                if schema in {"kavita-ingest-publication-v2", "kavita-ingest-publication-v3"}:
+                if schema in {"kavita-ingest-publication-v2", "kavita-ingest-publication-v3", "kavita-ingest-publication-v4"}:
                     if item.get("source_lifecycle") != "preserved":
                         continue
                     if item.get("action") not in {"published", "verified-existing-duplicate"}:
