@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 from datetime import UTC, datetime, timedelta
 from io import StringIO
@@ -37,6 +38,33 @@ def setup(tmp_path: Path):
 def video(path: Path, source: Path, destination: Path, *, mode="apply", copy=True, final=True):
     rows = [{"type":"header","mode":mode,"copy":copy,"version":1}, {"type":"operation","source":str(source),"destination":str(destination),"media_type":"tv","metadata":{}}]
     if final: rows.append({"type":"final","operations":1})
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+
+
+def video_v4(path: Path, source: Path, destination: Path) -> None:
+    rows = [
+        {
+            "type": "header",
+            "mode": "apply",
+            "copy": True,
+            "version": 4,
+            "report_schema": "video-ingest-publication-v4",
+            "producer": "video-ingest",
+            "producer_version": "0.2.0",
+            "producer_instance_id": machine_instance_id(),
+        },
+        {
+            "type": "operation",
+            "source": str(source),
+            "destination": str(destination),
+            "media_type": "tv",
+            "metadata": {},
+            "action": "published",
+            "source_lifecycle": "preserved",
+            "verification": "destination-created",
+        },
+        {"type": "final", "operations": 1, "status": "completed"},
+    ]
     path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
 
 
@@ -234,7 +262,7 @@ def test_apply_rechecks_identity_and_prunes(tmp_path: Path, monkeypatch: pytest.
     ingest, production, state, category, config = setup(tmp_path)
     nested = ingest / "nested"; nested.mkdir(); source = nested / "source"; destination = production / "dest"; source.write_bytes(b"x"); destination.write_bytes(b"x")
     video(state / "run" / "reports" / "report.json", source, destination)
-    items, _ = assess_category(config, category); payload = apply_deletions(items, {"TV": ingest})
+    items, _ = assess_category(config, category); payload = apply_deletions(items, {"TV": ingest}, config=config)
     assert payload["items"][0]["result"] == "deleted" and not source.exists() and ingest.exists() and not nested.exists()
 
 
@@ -312,7 +340,7 @@ def test_kavita_v3_partial_report_accepts_only_complete_items(tmp_path: Path):
         create_verification_plan(config, [complete_item])
 
 
-def test_legacy_saved_plan_cannot_bypass_kavita_backup_gate(
+def test_unbound_legacy_assessment_cannot_create_a_saved_plan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
@@ -332,12 +360,8 @@ def test_legacy_saved_plan_cannot_bypass_kavita_backup_gate(
         destination_sha256=digest,
     )
 
-    plan_id, _ = create_verification_plan(config, [legacy_safe])
-    payload, _ = load_verification_plan(config, plan_id)
-    reverified = verify_saved_plan(config, payload)
-
-    assert reverified[0].state == "BACKUP_REQUIRED"
-    assert reverified[0].reason_code == "INDEPENDENT_BACKUP_REQUIRED"
+    with pytest.raises(ValueError, match="bound to publication evidence"):
+        create_verification_plan(config, [legacy_safe])
 
 
 def test_kavita_v3_never_accepts_incomplete_item_marked_eligible(tmp_path: Path):
@@ -442,7 +466,7 @@ def test_batch_destination_change_aborts_before_any_deletion(tmp_path: Path, mon
         video(state / "run" / "reports" / f"{index}.json", source, destination)
     safe, _ = assess_category(config, category)
     destinations[1].write_bytes(b"changed")
-    payload = apply_deletions(safe, {"TV": ingest})
+    payload = apply_deletions(safe, {"TV": ingest}, config=config)
     assert payload["status"] == "partial-failure"
     assert all(source.exists() for source in sources)
 
@@ -456,11 +480,12 @@ def test_prevalidation_cancellation_records_interrupted_audit(tmp_path: Path, mo
     safe, _ = assess_category(config, category)
     audit = tmp_path / "audit.json"
 
-    def cancel(_path: Path, _complete: int, _total: int) -> None:
+    def cancel(*_args: object, **_kwargs: object) -> None:
         raise KeyboardInterrupt
 
+    monkeypatch.setattr(core_module, "_revalidate_deletion_item", cancel)
     with pytest.raises(KeyboardInterrupt):
-        apply_deletions(safe, {"TV": ingest}, audit, cancel)
+        apply_deletions(safe, {"TV": ingest}, audit, cancel, config=config)
     assert source.exists()
     assert json.loads(audit.read_text())["status"] == "interrupted"
 
@@ -483,7 +508,7 @@ def test_deletion_interruption_retains_crash_safe_audit(tmp_path: Path, monkeypa
 
     monkeypatch.setattr(Path, "unlink", interrupt)
     with pytest.raises(KeyboardInterrupt):
-        apply_deletions(safe, {"TV": ingest}, audit)
+        apply_deletions(safe, {"TV": ingest}, audit, config=config)
     assert source.exists()
     assert json.loads(audit.read_text())["status"] == "interrupted"
 
@@ -499,24 +524,22 @@ def test_first_deletion_race_stops_batch_and_retains_partial_audit(tmp_path: Pat
     safe, _ = assess_category(config, category)
     safe.sort(key=lambda item: item.source.name)
     audit = tmp_path / "audit.json"
-    original_identity = core_module._identity
+    original_revalidate = core_module._revalidate_deletion_item
     raced = False
-    first_destination_checks = 0
+    revalidation_calls = 0
 
-    def race(path: Path):
-        nonlocal raced, first_destination_checks
-        if path == destinations[0]:
-            first_destination_checks += 1
-        # Prevalidation hashes the destination and checks its identity twice.
-        # Change the second source only at the first item's immediate-delete
-        # destination recheck, after the whole batch has passed prevalidation.
-        if path == destinations[0] and first_destination_checks == 3 and not raced:
+    def race(*args: object, **kwargs: object) -> None:
+        nonlocal raced, revalidation_calls
+        revalidation_calls += 1
+        # Two calls prevalidate the batch. The third is the first item's
+        # immediate-unlink evidence check.
+        if revalidation_calls == 3 and not raced:
             raced = True
             sources[1].write_bytes(b"changed after batch verification")
-        return original_identity(path)
+        original_revalidate(*args, **kwargs)
 
-    monkeypatch.setattr(core_module, "_identity", race)
-    payload = apply_deletions(safe, {"TV": ingest}, audit)
+    monkeypatch.setattr(core_module, "_revalidate_deletion_item", race)
+    payload = apply_deletions(safe, {"TV": ingest}, audit, config=config)
     persisted = json.loads(audit.read_text())
     assert payload["status"] == persisted["status"] == "partial-failure"
     assert [item["result"] for item in persisted["items"]] == ["deleted", "skipped"]
@@ -1249,7 +1272,7 @@ def test_saved_plan_cli_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 
     assert cli.main(["show", plan_id]) == 0
     shown = capsys.readouterr().out
-    assert '"schema": "verification-plan-v1"' in shown
+    assert '"schema": "verification-plan-v2"' in shown
     assert str(source) in shown and str(destination) in shown
 
     monkeypatch.setattr("builtins.input", lambda prompt: "DELETE 1 VERIFIED SOURCES")
@@ -1337,3 +1360,175 @@ def test_apply_reuses_fresh_hashes_only_after_identity_and_report_revalidation(
 
     assert payload["status"] == "completed"
     assert not source.exists() and destination.exists()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "hash",
+        "replace",
+        "remove",
+        "corrupt",
+        "completion",
+        "producer",
+        "machine",
+        "schema",
+        "ambiguous",
+    ],
+)
+def test_apply_rejects_changed_publication_evidence_before_unlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    ingest, production, state, category, config = setup(tmp_path)
+    source = ingest / "source.mkv"
+    destination = production / "destination.mkv"
+    source.write_bytes(b"same")
+    destination.write_bytes(b"same")
+    report = state / "run" / "reports" / "report.json"
+    video_v4(report, source, destination)
+    assessed, rejected = assess_category(config, category)
+    assert not rejected and assessed[0].state == "SAFE"
+
+    if change == "hash":
+        rows = [json.loads(line) for line in report.read_text().splitlines()]
+        rows[1]["source_sha256"] = "0" * 64
+        report.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+        assert assess_category(config, category)[0][0].state == "REVIEW"
+    elif change == "replace":
+        replacement = report.with_suffix(".replacement")
+        replacement.write_bytes(report.read_bytes())
+        os.replace(replacement, report)
+    elif change == "remove":
+        report.unlink()
+    elif change == "corrupt":
+        report.write_text("{not-json}\n")
+    elif change == "completion":
+        rows = [json.loads(line) for line in report.read_text().splitlines()]
+        rows[-1]["status"] = "failed"
+        report.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    elif change in {"producer", "machine", "schema"}:
+        rows = [json.loads(line) for line in report.read_text().splitlines()]
+        key = {
+            "producer": "producer",
+            "machine": "producer_instance_id",
+            "schema": "report_schema",
+        }[change]
+        rows[0][key] = "invalid"
+        report.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    else:
+        other_destination = production / "other.mkv"
+        other_destination.write_bytes(source.read_bytes())
+        video_v4(
+            state / "run" / "reports" / "ambiguous.json",
+            source,
+            other_destination,
+        )
+
+    original_unlink = Path.unlink
+
+    def reject_source_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        if path == source:
+            raise AssertionError("unsafe source unlink reached")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", reject_source_unlink)
+    result = apply_deletions(
+        assessed,
+        {category.name: category.ingest_root},
+        tmp_path / f"{change}-audit.json",
+        config=config,
+    )
+
+    assert result["status"] == "partial-failure"
+    assert source.exists() and destination.exists()
+    assert "publication evidence changed" in str(result["error"])
+
+
+def test_apply_without_effective_config_cannot_bypass_evidence_revalidation(
+    tmp_path: Path,
+) -> None:
+    ingest, production, state, category, config = setup(tmp_path)
+    source = ingest / "source.mkv"
+    destination = production / "destination.mkv"
+    source.write_bytes(b"same")
+    destination.write_bytes(b"same")
+    video_v4(state / "run" / "reports" / "report.json", source, destination)
+    assessed, _ = assess_category(config, category)
+
+    result = apply_deletions(
+        assessed,
+        {category.name: category.ingest_root},
+        tmp_path / "missing-config-audit.json",
+    )
+
+    assert result["status"] == "partial-failure"
+    assert "configured evidence revalidation is required" in str(result["error"])
+    assert source.exists() and destination.exists()
+
+
+def test_saved_plan_and_verified_assessment_reject_later_report_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
+    ingest, production, state, category, config = setup(tmp_path)
+    source = ingest / "source.mkv"
+    destination = production / "destination.mkv"
+    source.write_bytes(b"same")
+    destination.write_bytes(b"same")
+    report = state / "run" / "reports" / "report.json"
+    video_v4(report, source, destination)
+    assessed, _ = assess_category(config, category)
+    plan_id, _ = create_verification_plan(config, assessed)
+    payload, _ = load_verification_plan(config, plan_id)
+    planned = payload["items"][0]
+    assert isinstance(planned, dict)
+    semantics = planned["evidence_semantics"]
+    assert isinstance(semantics, dict)
+    assert set(
+        (
+            "source_sha256",
+            "destination_sha256",
+            "transformed",
+            "producer",
+            "schema",
+            "machine_identity",
+            "completion_status",
+            "active",
+            "superseded_by",
+            "report_sha256",
+            "report_identity",
+        )
+    ).issubset(semantics)
+    assert isinstance(planned["evidence_fingerprint"], str)
+    verified = verify_saved_plan(config, payload)
+
+    rows = [json.loads(line) for line in report.read_text().splitlines()]
+    rows[1]["destination_sha256"] = "f" * 64
+    report.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+
+    with pytest.raises(ValueError, match="no longer accepted"):
+        verify_saved_plan(config, payload)
+    result = apply_deletions(
+        verified,
+        {category.name: category.ingest_root},
+        tmp_path / "saved-plan-audit.json",
+        config=config,
+    )
+    assert result["status"] == "partial-failure"
+    assert source.exists() and destination.exists()
+
+
+def test_atomic_audit_publication_fsyncs_parent_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
+    directories: list[Path] = []
+    monkeypatch.setattr(
+        core_module,
+        "_fsync_directory",
+        lambda directory: directories.append(directory),
+    )
+
+    target = write_audit({"status": "synthetic"})
+
+    assert directories == [target.parent]

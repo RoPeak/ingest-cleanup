@@ -1,12 +1,24 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import stat
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .config import Category, Config
 from .provenance import require_local_producer
+
+
+@dataclass(frozen=True)
+class ReportIdentity:
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+    links: int
 
 
 @dataclass(frozen=True)
@@ -23,6 +35,15 @@ class Evidence:
     archived_destination: Path | None = None
     archived_sha256: str | None = None
     superseded_by: Path | None = None
+    producer: str | None = None
+    schema: str | None = None
+    machine_identity: str | None = None
+    completion_status: str | None = None
+    report_sha256: str | None = None
+    report_identity: ReportIdentity | None = None
+    supersession_report: Path | None = None
+    supersession_report_sha256: str | None = None
+    supersession_report_identity: ReportIdentity | None = None
 
 
 @dataclass(frozen=True)
@@ -36,6 +57,61 @@ def _safe_report_file(path: Path, root: Path) -> bool:
         return path.is_file() and not path.is_symlink() and path.resolve(strict=True).is_relative_to(root.resolve(strict=True))
     except (OSError, RuntimeError, ValueError):
         return False
+
+
+def _read_report(path: Path, root: Path) -> tuple[str, str, ReportIdentity]:
+    """Read a report and bind its content and filesystem identity."""
+    if not _safe_report_file(path, root):
+        raise ValueError("unsafe report path")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(path, flags)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise ValueError("report is not a regular single-link file")
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            payload = handle.read()
+            after = os.fstat(handle.fileno())
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    identity = ReportIdentity(
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+        before.st_nlink,
+    )
+    after_identity = ReportIdentity(
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+        after.st_nlink,
+    )
+    current = path.lstat()
+    current_identity = ReportIdentity(
+        current.st_dev,
+        current.st_ino,
+        current.st_size,
+        current.st_mtime_ns,
+        current.st_ctime_ns,
+        current.st_nlink,
+    )
+    if identity != after_identity or identity != current_identity:
+        raise ValueError("report changed while being read")
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("report is not valid UTF-8") from exc
+    return text, hashlib.sha256(payload).hexdigest(), identity
 
 
 def _absolute_clean(value: object) -> Path | None:
@@ -54,10 +130,9 @@ def video_records(config: Config, category: Category) -> tuple[list[Evidence], l
         if not root.is_dir() or root.is_symlink():
             continue
         for report in root.glob("*/reports/*.json"):
-            if not _safe_report_file(report, root):
-                rejected.append(RejectedReport(report, "unsafe report path")); continue
             try:
-                rows = [json.loads(line) for line in report.read_text(encoding="utf-8").splitlines() if line.strip()]
+                text, report_hash, report_identity = _read_report(report, root)
+                rows = [json.loads(line) for line in text.splitlines() if line.strip()]
                 if len(rows) < 2 or not isinstance(rows[0], dict):
                     raise ValueError("not a successful JSON Lines report")
                 header = rows[0]
@@ -98,7 +173,35 @@ def video_records(config: Config, category: Category) -> tuple[list[Evidence], l
                         raise ValueError("operation has invalid source hash")
                     if destination_hash is not None and (not isinstance(destination_hash, str) or len(destination_hash) != 64):
                         raise ValueError("operation has invalid destination hash")
-                    records.append(Evidence(source, destination, "video", report, f"{report}:{index}", source_hash, destination_hash))
+                    records.append(
+                        Evidence(
+                            source=source,
+                            destination=destination,
+                            adapter="video",
+                            report=report,
+                            report_id=f"{report}:{index}",
+                            source_sha256=source_hash,
+                            destination_sha256=destination_hash,
+                            producer=header.get("producer")
+                            if isinstance(header.get("producer"), str)
+                            else None,
+                            schema=(
+                                str(header.get("report_schema"))
+                                if header.get("report_schema") is not None
+                                else f"video-jsonl-v{version}"
+                            ),
+                            machine_identity=header.get("producer_instance_id")
+                            if isinstance(header.get("producer_instance_id"), str)
+                            else None,
+                            completion_status=(
+                                str(rows[-1].get("status"))
+                                if rows[-1].get("status") is not None
+                                else "legacy-completed"
+                            ),
+                            report_sha256=report_hash,
+                            report_identity=report_identity,
+                        )
+                    )
             except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
                 rejected.append(RejectedReport(report, str(exc)))
     return records, rejected
@@ -111,10 +214,9 @@ def music_records(config: Config, category: Category) -> tuple[list[Evidence], l
     if root is None or not root.is_dir() or root.is_symlink():
         return records, rejected
     for report in root.glob("reports/*.json"):
-        if not _safe_report_file(report, root):
-            rejected.append(RejectedReport(report, "unsafe report path")); continue
         try:
-            data = json.loads(report.read_text(encoding="utf-8"))
+            text, report_hash, report_identity = _read_report(report, root)
+            data = json.loads(text)
             if not isinstance(data, dict): raise ValueError("report is not an object")
             schema = data.get("report_schema")
             if schema not in {"music-ingest-publication-v1", "music-ingest-publication-v2", "music-ingest-publication-v3"}:
@@ -149,7 +251,27 @@ def music_records(config: Config, category: Category) -> tuple[list[Evidence], l
                     sh, dh = item.get("source_sha256"), item.get("destination_sha256")
                     for value in (sh, dh):
                         if value is not None and (not isinstance(value, str) or len(value) != 64): raise ValueError("v2/v3 item has invalid hash")
-                    records.append(Evidence(source_path, final_destination, "music", report, f"{report}:{index}", sh, dh))
+                    records.append(
+                        Evidence(
+                            source=source_path,
+                            destination=final_destination,
+                            adapter="music",
+                            report=report,
+                            report_id=f"{report}:{index}",
+                            source_sha256=sh,
+                            destination_sha256=dh,
+                            producer=data.get("producer")
+                            if isinstance(data.get("producer"), str)
+                            else None,
+                            schema=str(schema),
+                            machine_identity=data.get("producer_instance_id")
+                            if isinstance(data.get("producer_instance_id"), str)
+                            else None,
+                            completion_status="completed",
+                            report_sha256=report_hash,
+                            report_identity=report_identity,
+                        )
+                    )
                 continue
             tracks = [track for album in data.get("albums", []) if isinstance(album, dict) for track in album.get("tracks", []) if isinstance(track, dict)]
             for index, track in enumerate(tracks, 1):
@@ -164,7 +286,25 @@ def music_records(config: Config, category: Category) -> tuple[list[Evidence], l
                         or track.get("source_size_bytes") != track.get("staged_size_bytes")
                         or track.get("publication_status") != "published_or_verified_existing"):
                     raise ValueError("track does not prove successful publication")
-                records.append(Evidence(source_path, final_destination, "music", report, f"{report}:{index}"))
+                records.append(
+                    Evidence(
+                        source=source_path,
+                        destination=final_destination,
+                        adapter="music",
+                        report=report,
+                        report_id=f"{report}:{index}",
+                        producer=data.get("producer")
+                        if isinstance(data.get("producer"), str)
+                        else None,
+                        schema=str(schema),
+                        machine_identity=data.get("producer_instance_id")
+                        if isinstance(data.get("producer_instance_id"), str)
+                        else None,
+                        completion_status="completed",
+                        report_sha256=report_hash,
+                        report_identity=report_identity,
+                    )
+                )
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
             rejected.append(RejectedReport(report, str(exc)))
     return records, rejected
@@ -182,8 +322,8 @@ def kavita_records(config: Config, category: Category) -> tuple[list[Evidence], 
         return records, rejected
     for report in root.glob("kavita-reports/*.json"):
         try:
-            if not _safe_report_file(report, root): raise ValueError("unsafe report path")
-            data = json.loads(report.read_text(encoding="utf-8"))
+            text, report_hash, report_identity = _read_report(report, root)
+            data = json.loads(text)
             if not isinstance(data, dict) or data.get("report_schema") not in {"kavita-ingest-publication-v1", "kavita-ingest-publication-v2", "kavita-ingest-publication-v3", "kavita-ingest-publication-v4"}:
                 raise ValueError("unsupported Kavita publication schema")
             schema = data.get("report_schema")
@@ -226,7 +366,28 @@ def kavita_records(config: Config, category: Category) -> tuple[list[Evidence], 
                 sh, dh = item.get("source_sha256"), item.get("destination_sha256")
                 if not all(isinstance(x, str) and len(x) == 64 for x in (sh, dh)):
                     raise ValueError("item lacks safe hashes")
-                records.append(Evidence(source, destination, "kavita", report, f"{report}:{index}", sh, dh, bool(item.get("transformations"))))
+                records.append(
+                    Evidence(
+                        source=source,
+                        destination=destination,
+                        adapter="kavita",
+                        report=report,
+                        report_id=f"{report}:{index}",
+                        source_sha256=sh,
+                        destination_sha256=dh,
+                        transformed=bool(item.get("transformations")),
+                        producer=data.get("producer")
+                        if isinstance(data.get("producer"), str)
+                        else None,
+                        schema=str(schema),
+                        machine_identity=data.get("producer_instance_id")
+                        if isinstance(data.get("producer_instance_id"), str)
+                        else None,
+                        completion_status=str(data.get("status")),
+                        report_sha256=report_hash,
+                        report_identity=report_identity,
+                    )
+                )
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
             rejected.append(RejectedReport(report, str(exc)))
     reconciled, supersession_rejected = _apply_kavita_supersessions(
@@ -250,9 +411,8 @@ def _apply_kavita_supersessions(
     rejected: list[RejectedReport] = []
     for report in sorted(report_root.glob("*.json")):
         try:
-            if not _safe_report_file(report, root):
-                raise ValueError("unsafe supersession report path")
-            data = json.loads(report.read_text(encoding="utf-8"))
+            text, report_hash, report_identity = _read_report(report, root)
+            data = json.loads(text)
             if (
                 not isinstance(data, dict)
                 or data.get("report_schema") != "kavita-ingest-supersession-v1"
@@ -325,6 +485,9 @@ def _apply_kavita_supersessions(
                         archived_destination=archived,
                         archived_sha256=str(hashes[1]),
                         superseded_by=new,
+                        supersession_report=report,
+                        supersession_report_sha256=report_hash,
+                        supersession_report_identity=report_identity,
                     )
             output = candidate
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:

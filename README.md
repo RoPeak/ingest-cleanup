@@ -41,19 +41,25 @@ ingest-cleanup apply   # backwards-compatible one-shot verify/review/apply
 ```
 
 `status` never declares a source deletion-ready. `verify` changes no Incoming
-or library files; it writes an immutable, owner-only `verification-plan-v1`
+or library files; it writes an immutable, owner-only `verification-plan-v2`
 under `$XDG_STATE_HOME/ingest-cleanup/plans/`. Plans expire after 24 hours and
 are bound to the effective configuration, endpoint identities, hashes, sizes,
-categories, and evidence identifiers. `apply PLAN_ID` fully rehashes the saved
-plan, while bare `apply` retains the one-shot workflow.
+categories, and a complete semantic fingerprint of the accepted producer
+evidence. That fingerprint includes the report digest and filesystem identity,
+endpoint hash claims, transformation/supersession state, and
+producer/schema/machine/completion fields. Old unbound plan schemas are
+rejected. `apply PLAN_ID` fully rehashes the saved plan, while bare `apply`
+retains the one-shot workflow.
 
 After typed confirmation, `apply` safely reuses the just-computed hashes only
 when source and destination device, inode, size, mtime, ctime and link count are
 unchanged, the exact producer record is still accepted, and any required Kavita
-backup proof is still current. It rechecks endpoint identity again immediately
-before unlink. This avoids an unnecessary third full read without carrying a
-hash across a changed filesystem or evidence boundary. Library and Incoming
-changes fail closed. The command shows human-readable per-category totals and
+backup proof is still current. It rereads and reassesses that item's report and
+mapping ambiguity, then rechecks endpoint identity at the immediate unlink
+boundary. Deletion without the effective configuration is refused. This avoids
+an unnecessary third full read without carrying a hash across a changed
+filesystem or evidence boundary. Library, Incoming, report, and mapping changes
+fail closed. The command shows human-readable per-category totals and
 requires `DELETE <count> VERIFIED SOURCES`. It
 creates a crash-safe audit before deletion and atomically updates it after each
 item under `$XDG_STATE_HOME/ingest-cleanup/reports/` (or
@@ -82,6 +88,10 @@ with `item_state=complete` and `cleanup_eligible=true` are consumed. Failed,
 blocked, and uncertain siblings provide no evidence but do not invalidate an
 independently completed item. Known video JSONL v1-v3, music v1-v2 and Kavita
 v1-v3 schemas remain readable only from explicitly configured local state roots.
+Those legacy schemas are not machine-bound: the configured root is a discovery
+boundary, not proof of host origin. Do not copy or synchronize legacy report
+state between machines; deployments requiring deletion from legacy evidence
+must separately inventory and trust those report files.
 New `video-ingest-publication-v4`, `music-ingest-publication-v3`, and
 `kavita-ingest-publication-v4` reports identify producer version and a stable,
 non-secret machine instance; cleanup refuses them on another machine. Unknown

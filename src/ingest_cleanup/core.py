@@ -42,6 +42,64 @@ class Assessment:
     destination_identity: Identity | None = None
     destination_sha256: str | None = None
     evidence_identifier: str | None = None
+    evidence_fingerprint: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.evidence is not None and self.evidence_fingerprint is None:
+            object.__setattr__(
+                self,
+                "evidence_fingerprint",
+                _evidence_fingerprint(self.evidence),
+            )
+
+
+def _evidence_semantics(evidence: Evidence) -> dict[str, object]:
+    """Return every report property that can affect deletion safety."""
+    return {
+        "source": str(evidence.source),
+        "destination": str(evidence.destination),
+        "adapter": evidence.adapter,
+        "report": str(evidence.report),
+        "report_id": evidence.report_id,
+        "source_sha256": evidence.source_sha256,
+        "destination_sha256": evidence.destination_sha256,
+        "transformed": evidence.transformed,
+        "active": evidence.active,
+        "archived_destination": str(evidence.archived_destination)
+        if evidence.archived_destination
+        else None,
+        "archived_sha256": evidence.archived_sha256,
+        "superseded_by": str(evidence.superseded_by)
+        if evidence.superseded_by
+        else None,
+        "producer": evidence.producer,
+        "schema": evidence.schema,
+        "machine_identity": evidence.machine_identity,
+        "completion_status": evidence.completion_status,
+        "report_sha256": evidence.report_sha256,
+        "report_identity": asdict(evidence.report_identity)
+        if evidence.report_identity
+        else None,
+        "supersession_report": str(evidence.supersession_report)
+        if evidence.supersession_report
+        else None,
+        "supersession_report_sha256": evidence.supersession_report_sha256,
+        "supersession_report_identity": asdict(
+            evidence.supersession_report_identity
+        )
+        if evidence.supersession_report_identity
+        else None,
+    }
+
+
+def _evidence_fingerprint(evidence: Evidence) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            _evidence_semantics(evidence),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
 
 
 REASON_CODES = {
@@ -646,8 +704,15 @@ def config_fingerprint(config: Config) -> str:
 def create_verification_plan(
     config: Config, items: list[Assessment]
 ) -> tuple[str, Path]:
-    if not items or any(item.state != "SAFE" for item in items):
-        raise ValueError("verification plans require at least one deletion-ready item")
+    if not items or any(
+        item.state != "SAFE"
+        or item.evidence is None
+        or item.evidence_fingerprint is None
+        for item in items
+    ):
+        raise ValueError(
+            "verification plans require deletion-ready items bound to publication evidence"
+        )
     now = datetime.now(UTC)
     plan_id = now.strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(6)
     folder = xdg_state() / "plans"
@@ -655,7 +720,7 @@ def create_verification_plan(
     os.chmod(folder, 0o700)
     target = folder / f"{plan_id}.json"
     payload = {
-        "schema": "verification-plan-v1",
+        "schema": "verification-plan-v2",
         "plan_id": plan_id,
         "created_at": now.isoformat(),
         "expires_at": (now + timedelta(hours=24)).isoformat(),
@@ -680,6 +745,10 @@ def create_verification_plan(
                 "evidence_identifier": item.evidence.report_id
                 if item.evidence
                 else item.evidence_identifier,
+                "evidence_fingerprint": item.evidence_fingerprint,
+                "evidence_semantics": _evidence_semantics(item.evidence)
+                if item.evidence
+                else None,
             }
             for item in items
         ],
@@ -694,6 +763,7 @@ def create_verification_plan(
         handle.flush()
         os.fsync(handle.fileno())
     os.chmod(target, 0o400)
+    _fsync_directory(folder)
     return plan_id, target
 
 
@@ -716,7 +786,7 @@ def load_verification_plan(
     payload = json.loads(target.read_text(encoding="utf-8"))
     if (
         not isinstance(payload, dict)
-        or payload.get("schema") != "verification-plan-v1"
+        or payload.get("schema") != "verification-plan-v2"
         or payload.get("plan_id") != plan_id
     ):
         raise ValueError("unsupported or tampered verification plan")
@@ -745,7 +815,7 @@ def verify_saved_plan(
     progress: Callable[[Path, int, int], None] | None = None,
 ) -> list[Assessment]:
     categories = {c.name: c for c in config.categories}
-    evidence_cache: dict[str, list[Evidence]] = {}
+    assessment_cache: dict[str, list[Assessment]] = {}
     verified: list[Assessment] = []
     for raw in payload["items"]:  # type: ignore[index]
         if not isinstance(raw, dict) or raw.get("category") not in categories:
@@ -761,23 +831,29 @@ def verify_saved_plan(
         ):
             raise ValueError("plan contains an unsafe path")
         identifier = raw.get("evidence_identifier")
-        if category.name not in evidence_cache:
-            evidence_cache[category.name] = collect(config, category)[0]
-        records = evidence_cache[category.name]
-        evidence = next(
-            (
-                item
-                for item in records
-                if item.report_id == identifier
-                and item.source == source
-                and item.destination == destination
-            ),
-            None,
-        )
-        if evidence is None and not (
-            identifier is None and category.adapter == "kavita"
+        if category.name not in assessment_cache:
+            assessment_cache[category.name] = assess_category(
+                config, category, hash_files=False
+            )[0]
+        current = [
+            item for item in assessment_cache[category.name] if item.source == source
+        ]
+        planned_fingerprint = raw.get("evidence_fingerprint")
+        planned_semantics = raw.get("evidence_semantics")
+        if (
+            len(current) != 1
+            or current[0].state != "CANDIDATE"
+            or current[0].evidence is None
+            or current[0].evidence.report_id != identifier
+            or current[0].destination != destination
+            or not isinstance(planned_fingerprint, str)
+            or not secrets.compare_digest(
+                _evidence_fingerprint(current[0].evidence), planned_fingerprint
+            )
+            or _evidence_semantics(current[0].evidence) != planned_semantics
         ):
             raise ValueError("planned publication evidence is no longer accepted")
+        evidence = current[0].evidence
         _set_phase(progress, f"Hashing {category.name}")
         source_hash, source_id = _hash(source, progress)
         destination_hash, destination_id = _hash(destination, progress)
@@ -857,6 +933,16 @@ def verify_saved_plan(
     return verified
 
 
+def _fsync_directory(directory: Path) -> None:
+    if not hasattr(os, "O_DIRECTORY"):
+        return
+    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _atomic_write(target: Path, payload: dict[str, object]) -> None:
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     temp = target.with_name(f".{target.name}.{secrets.token_hex(4)}.tmp")
@@ -868,6 +954,7 @@ def _atomic_write(target: Path, payload: dict[str, object]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp, target)
+        _fsync_directory(target.parent)
     finally:
         temp.unlink(missing_ok=True)
 
@@ -883,71 +970,77 @@ def new_audit_path() -> Path:
     )
 
 
+def _revalidate_deletion_item(
+    item: Assessment,
+    config: Config,
+    progress: Callable[[Path, int, int], None] | None = None,
+) -> None:
+    if (
+        item.state != "SAFE"
+        or item.source_identity is None
+        or item.destination_identity is None
+        or item.destination is None
+        or item.sha256 is None
+        or item.destination_sha256 is None
+        or item.evidence is None
+        or item.evidence_fingerprint is None
+    ):
+        raise ValueError("item is not bound to fresh verified publication evidence")
+    source_id = _identity(item.source)
+    destination_id = _identity(item.destination)
+    if (
+        source_id != item.source_identity
+        or destination_id != item.destination_identity
+    ):
+        raise ValueError(f"endpoint identity changed before deletion: {item.source}")
+    category = next(
+        (value for value in config.categories if value.name == item.category), None
+    )
+    if category is None:
+        raise ValueError("verified item category is no longer configured")
+    current = [
+        value
+        for value in assess_category(config, category, hash_files=False)[0]
+        if value.source == item.source
+    ]
+    if (
+        len(current) != 1
+        or current[0].state != "CANDIDATE"
+        or current[0].evidence is None
+        or current[0].destination != item.destination
+        or current[0].evidence.report_id != item.evidence.report_id
+        or not secrets.compare_digest(
+            _evidence_fingerprint(current[0].evidence), item.evidence_fingerprint
+        )
+    ):
+        raise ValueError("publication evidence changed before deletion")
+    if _evidence_semantics(current[0].evidence) != _evidence_semantics(
+        item.evidence
+    ):
+        raise ValueError("publication evidence safety semantics changed before deletion")
+    if category.adapter == "kavita":
+        _set_phase(progress, f"Backup verification {item.category}")
+        proof, reason = find_backup_proof(
+            config.backup_proof_root,
+            source=item.source,
+            source_sha256=item.sha256,
+            publication=item.destination,
+            publication_sha256=item.destination_sha256,
+        )
+        if proof is None:
+            raise ValueError(f"backup evidence changed before deletion: {reason}")
+
+
 def _prevalidate(
     items: list[Assessment],
     progress: Callable[[Path, int, int], None] | None = None,
     config: Config | None = None,
 ) -> None:
-    evidence_cache: dict[str, list[Evidence]] = {}
+    if config is None:
+        raise ValueError("configured evidence revalidation is required for deletion")
     for item in items:
-        if (
-            item.state != "SAFE"
-            or item.source_identity is None
-            or item.destination_identity is None
-            or item.destination is None
-        ):
-            raise ValueError("batch contains an item that was not freshly verified")
         _set_phase(progress, f"Deletion revalidation {item.category}")
-        if config is None:
-            source_hash, source_id = _hash(item.source, progress)
-            destination_hash, destination_id = _hash(item.destination, progress)
-            if (
-                source_id != item.source_identity
-                or destination_id != item.destination_identity
-                or source_hash != item.sha256
-                or destination_hash != item.destination_sha256
-            ):
-                raise ValueError(f"endpoint changed before deletion: {item.source}")
-            continue
-        source_id, destination_id = _identity(item.source), _identity(item.destination)
-        if (
-            source_id != item.source_identity
-            or destination_id != item.destination_identity
-        ):
-            raise ValueError(
-                f"endpoint identity changed before deletion: {item.source}"
-            )
-        category = next(
-            (value for value in config.categories if value.name == item.category), None
-        )
-        if category is None:
-            raise ValueError("verified item category is no longer configured")
-        if item.sha256 is None or item.destination_sha256 is None:
-            raise ValueError("verified item is missing endpoint hashes")
-        identifier = (
-            item.evidence.report_id if item.evidence else item.evidence_identifier
-        )
-        if category.name not in evidence_cache:
-            evidence_cache[category.name] = collect(config, category)[0]
-        records = evidence_cache[category.name]
-        if not any(
-            record.report_id == identifier
-            and record.source == item.source
-            and record.destination == item.destination
-            for record in records
-        ):
-            raise ValueError("publication evidence changed before deletion")
-        if category.adapter == "kavita":
-            _set_phase(progress, f"Backup verification {item.category}")
-            proof, reason = find_backup_proof(
-                config.backup_proof_root,
-                source=item.source,
-                source_sha256=str(item.sha256),
-                publication=item.destination,
-                publication_sha256=str(item.destination_sha256),
-            )
-            if proof is None:
-                raise ValueError(f"backup evidence changed before deletion: {reason}")
+        _revalidate_deletion_item(item, config, progress)
 
 
 def apply_deletions(
@@ -996,14 +1089,14 @@ def apply_deletions(
                 "result": "skipped",
             }
             try:
-                if (
-                    item.destination is None
-                    or _identity(item.source) != item.source_identity
-                    or _identity(item.destination) != item.destination_identity
-                ):
+                if config is None:
                     raise ValueError(
-                        "source or destination changed after batch verification"
+                        "configured evidence revalidation is required for deletion"
                     )
+                # Batch prevalidation cannot cover evidence changes while
+                # earlier items are processed. Re-read this item's producer
+                # report at the immediate unlink boundary.
+                _revalidate_deletion_item(item, config, progress)
                 item.source.unlink()
                 entry["result"] = "deleted"
                 pruned.extend(_prune_empty(item.source, roots[item.category]))
