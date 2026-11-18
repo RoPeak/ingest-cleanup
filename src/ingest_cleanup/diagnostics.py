@@ -7,6 +7,7 @@ from pathlib import Path
 from . import __version__
 from .adapters import collect
 from .config import Config
+from .legacy_inventory import inventory_status
 from .provenance import machine_instance_id
 
 SUPPORTED_SCHEMAS = {
@@ -113,6 +114,7 @@ def compatibility_payload(config: Config) -> dict[str, object]:
         "program": "ingest-cleanup",
         "version": __version__,
         "machine_instance_id": machine_instance_id(),
+        "legacy_report_inventory": inventory_status(config),
         "supported_report_schemas": SUPPORTED_SCHEMAS,
         "configured_categories": [
             {

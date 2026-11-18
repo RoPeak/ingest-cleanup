@@ -34,6 +34,7 @@ ingest-cleanup status  # read-only provenance, existence, and size assessment
 ingest-cleanup status --json
 ingest-cleanup reconcile Comics  # advisory filename/size suggestions only
 ingest-cleanup compatibility --json
+ingest-cleanup legacy-inventory status --json
 ingest-cleanup verify  # SHA-256 verification; saves a private 24-hour plan
 ingest-cleanup show PLAN_ID
 ingest-cleanup apply PLAN_ID
@@ -87,11 +88,16 @@ Kavita publication v3 may also represent a partial producer run: only entries
 with `item_state=complete` and `cleanup_eligible=true` are consumed. Failed,
 blocked, and uncertain siblings provide no evidence but do not invalidate an
 independently completed item. Known video JSONL v1-v3, music v1-v2 and Kavita
-v1-v3 schemas remain readable only from explicitly configured local state roots.
-Those legacy schemas are not machine-bound: the configured root is a discovery
-boundary, not proof of host origin. Do not copy or synchronize legacy report
-state between machines; deployments requiring deletion from legacy evidence
-must separately inventory and trust those report files.
+v1-v3 schemas are rejected by default. Those legacy schemas are not
+machine-bound: a configured root is only a discovery boundary, not proof of
+host origin. An operator may separately create a private
+`trusted-legacy-reports-v1` inventory with
+`ingest-cleanup legacy-inventory create --yes --report PATH ...`; it pins every
+selected report's path, adapter/schema, digest, filesystem identity, and this
+machine identity. A missing, invalid, replaced, changed, removed, corrupt, or
+cross-machine entry fails closed. Do not copy or synchronize producer state,
+legacy reports, or the inventory between machines. The inventory does not
+manufacture missing publication evidence.
 New `video-ingest-publication-v4`, `music-ingest-publication-v3`, and
 `kavita-ingest-publication-v4` reports identify producer version and a stable,
 non-secret machine instance; cleanup refuses them on another machine. Unknown

@@ -695,6 +695,11 @@ def config_fingerprint(config: Config) -> str:
         "backup_proof_root": str(config.backup_proof_root.resolve(strict=False))
         if config.backup_proof_root
         else None,
+        "legacy_inventory_path": str(
+            config.legacy_inventory_path.resolve(strict=False)
+        )
+        if config.legacy_inventory_path
+        else None,
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()

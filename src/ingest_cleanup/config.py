@@ -40,6 +40,7 @@ class Config:
     kavita_enabled: bool
     kavita_state_root: Path | None = None
     backup_proof_root: Path | None = None
+    legacy_inventory_path: Path | None = None
 
 
 def _path(value: object, label: str) -> Path:
@@ -75,6 +76,7 @@ def load(path: Path | None = None) -> Config:
     music = state.get("music_root")
     kavita_root = state.get("kavita_root")
     backup_proof_root = state.get("backup_proof_root")
+    legacy_inventory_path = state.get("legacy_report_inventory")
     legacy_kavita = state.get("kavita_enabled")
     if legacy_kavita is not None and not isinstance(legacy_kavita, bool):
         raise ValueError("state.kavita_enabled must be boolean")
@@ -91,6 +93,11 @@ def load(path: Path | None = None) -> Config:
             _path(backup_proof_root, "state.backup_proof_root")
             if backup_proof_root is not None
             else xdg_state() / "backup-proofs"
+        ),
+        (
+            _path(legacy_inventory_path, "state.legacy_report_inventory")
+            if legacy_inventory_path is not None
+            else xdg_state() / "trusted-legacy-reports-v1.json"
         ),
     )
 

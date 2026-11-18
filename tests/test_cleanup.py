@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import subprocess
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from io import StringIO
 from pathlib import Path
@@ -12,6 +13,7 @@ import pytest
 
 from ingest_cleanup import cli
 from ingest_cleanup import core as core_module
+from ingest_cleanup import legacy_inventory as legacy_inventory_module
 from ingest_cleanup.backup_proof import create_backup_proof, find_backup_proof
 from ingest_cleanup.config import Category, Config, kavita_xdg_state, validate
 from ingest_cleanup.core import (
@@ -26,6 +28,7 @@ from ingest_cleanup.core import (
 from ingest_cleanup.progress import ProgressDisplay
 from ingest_cleanup.provenance import machine_instance_id
 from ingest_cleanup.reconciliation import reconcile
+from ingest_cleanup.legacy_inventory import create_inventory, inventory_status
 
 
 def setup(tmp_path: Path):
@@ -36,8 +39,21 @@ def setup(tmp_path: Path):
 
 
 def video(path: Path, source: Path, destination: Path, *, mode="apply", copy=True, final=True):
-    rows = [{"type":"header","mode":mode,"copy":copy,"version":1}, {"type":"operation","source":str(source),"destination":str(destination),"media_type":"tv","metadata":{}}]
-    if final: rows.append({"type":"final","operations":1})
+    rows = [
+        {
+            "type": "header", "mode": mode, "copy": copy, "version": 4,
+            "report_schema": "video-ingest-publication-v4", "producer": "video-ingest",
+            "producer_version": "0.2.0", "producer_instance_id": machine_instance_id(),
+        },
+        {
+            "type": "operation", "source": str(source), "destination": str(destination),
+            "media_type": "tv", "metadata": {}, "action": "published",
+            "source_lifecycle": "preserved" if copy else "removed",
+            "verification": "destination-created",
+        },
+    ]
+    if final:
+        rows.append({"type": "final", "operations": 1, "status": "completed"})
     path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
 
 
@@ -66,6 +82,17 @@ def video_v4(path: Path, source: Path, destination: Path) -> None:
         {"type": "final", "operations": 1, "status": "completed"},
     ]
     path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+
+
+def trusted_legacy_config(config: Config, *reports: Path) -> Config:
+    """Create an explicit private inventory in a disposable test directory."""
+    assert reports
+    configured = replace(
+        config,
+        legacy_inventory_path=reports[0].parent.parent / "trusted-legacy-v1.json",
+    )
+    create_inventory(configured, list(reports))
+    return configured
 
 
 def test_v4_video_report_is_machine_bound(tmp_path: Path):
@@ -105,6 +132,115 @@ def test_success_and_conflict_destination(tmp_path: Path):
     assert not bad and [(item.state, item.destination) for item in items] == [("SAFE", destination)]
 
 
+def _legacy_video_report(path: Path, source: Path, destination: Path) -> None:
+    rows = [
+        {"type": "header", "mode": "apply", "copy": True, "version": 1},
+        {
+            "type": "operation", "source": str(source),
+            "destination": str(destination), "media_type": "tv", "metadata": {},
+        },
+        {"type": "final", "operations": 1},
+    ]
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+
+
+def test_legacy_report_requires_explicit_digest_pinned_inventory(tmp_path: Path):
+    ingest, production, state, category, config = setup(tmp_path)
+    source = ingest / "episode.mkv"; destination = production / "episode.mkv"
+    source.write_bytes(b"same"); destination.write_bytes(b"same")
+    report = state / "run" / "reports" / "legacy.json"
+    _legacy_video_report(report, source, destination)
+
+    items, rejected = assess_category(config, category)
+    assert items[0].reason_code == "NO_ACCEPTED_REPORT"
+    assert rejected and "trusted inventory" in rejected[0].reason
+    assert inventory_status(config)["state"] == "missing"
+
+    config = trusted_legacy_config(config, report)
+    assert inventory_status(config)["state"] == "valid"
+    assert config.legacy_inventory_path is not None
+    assert config.legacy_inventory_path.stat().st_mode & 0o777 == 0o400
+    items, rejected = assess_category(config, category)
+    assert not rejected and items[0].state == "SAFE"
+
+
+def test_legacy_inventory_fails_closed_for_machine_or_integrity_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    ingest, production, state, category, config = setup(tmp_path)
+    source = ingest / "episode.mkv"; destination = production / "episode.mkv"
+    source.write_bytes(b"same"); destination.write_bytes(b"same")
+    report = state / "run" / "reports" / "legacy.json"
+    _legacy_video_report(report, source, destination)
+    config = trusted_legacy_config(config, report)
+
+    monkeypatch.setattr(legacy_inventory_module, "machine_instance_id", lambda: "0" * 64)
+    items, rejected = assess_category(config, category)
+    assert items[0].reason_code == "NO_ACCEPTED_REPORT"
+    assert rejected and "different machine" in rejected[0].reason
+
+    monkeypatch.undo()
+    assert config.legacy_inventory_path is not None
+    config.legacy_inventory_path.chmod(0o600)
+    payload = json.loads(config.legacy_inventory_path.read_text())
+    payload["machine_instance_id"] = "0" * 64
+    config.legacy_inventory_path.write_text(json.dumps(payload))
+    config.legacy_inventory_path.chmod(0o400)
+    assert inventory_status(config)["state"] == "invalid"
+    items, rejected = assess_category(config, category)
+    assert items[0].reason_code == "NO_ACCEPTED_REPORT"
+    assert rejected and "integrity" in rejected[0].reason
+
+
+@pytest.mark.parametrize("change", ["mutate", "replace", "remove", "corrupt", "completion"])
+def test_pinned_legacy_report_cannot_be_reused_after_any_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
+):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
+    ingest, production, state, category, config = setup(tmp_path)
+    source = ingest / "episode.mkv"; destination = production / "episode.mkv"
+    source.write_bytes(b"same"); destination.write_bytes(b"same")
+    report = state / "run" / "reports" / "legacy.json"
+    _legacy_video_report(report, source, destination)
+    config = trusted_legacy_config(config, report)
+    assessed, rejected = assess_category(config, category)
+    assert not rejected and assessed[0].state == "SAFE"
+    plan_id, _ = create_verification_plan(config, assessed)
+    plan, _ = load_verification_plan(config, plan_id)
+
+    if change == "mutate":
+        report.write_text(report.read_text() + "\n")
+    elif change == "replace":
+        replacement = report.with_suffix(".replacement")
+        replacement.write_bytes(report.read_bytes())
+        os.replace(replacement, report)
+    elif change == "remove":
+        report.unlink()
+    elif change == "corrupt":
+        report.write_text("{not-json}\n")
+    else:
+        rows = [json.loads(line) for line in report.read_text().splitlines()]
+        rows.pop()
+        report.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+
+    with pytest.raises(ValueError, match="no longer accepted"):
+        verify_saved_plan(config, plan)
+
+    original_unlink = Path.unlink
+
+    def refuse_source_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        if path == source:
+            raise AssertionError("unsafe source unlink reached")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", refuse_source_unlink)
+    result = apply_deletions(
+        assessed, {category.name: category.ingest_root}, tmp_path / "audit.json", config=config
+    )
+    assert result["status"] == "partial-failure"
+    assert source.exists() and destination.exists()
+
+
 def test_v2_verified_existing_duplicate_requires_fresh_hash_verification(tmp_path: Path):
     ingest, production, state, category, config = setup(tmp_path)
     source = ingest / "O'Brien S01E01.mkv"; destination = production / "O'Brien S01E01.mkv"
@@ -116,6 +252,7 @@ def test_v2_verified_existing_duplicate_requires_fresh_hash_verification(tmp_pat
         {"type": "final", "operations": 1},
     ]
     report.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    config = trusted_legacy_config(config, report)
     candidates, bad = assess_category(config, category, hash_files=False)
     assert not bad and candidates[0].state == "CANDIDATE"
     verified, bad = assess_category(config, category)
@@ -146,7 +283,11 @@ def test_unsuccessful_video_report_is_not_proof(tmp_path: Path, mode: str, copy:
     source = ingest / "source"; destination = production / "dest"; source.write_bytes(b"x"); destination.write_bytes(b"x")
     video(state / "run" / "reports" / "report.json", source, destination, mode=mode, copy=copy, final=final)
     items, bad = assess_category(config, category)
-    assert items[0].state == "UNKNOWN" and bad
+    assert items[0].state == "UNKNOWN"
+    if not copy:
+        assert not bad  # A completed move report is valid but supplies no proof.
+    else:
+        assert bad
 
 
 @pytest.mark.parametrize("destination_bytes,reason", [(None, "published destination missing"), (b"xx", "size mismatch"), (b"y", "content mismatch")])
@@ -200,6 +341,7 @@ def test_stale_v1_mapping_does_not_mask_unique_v2_existing_duplicate(tmp_path: P
         {"type": "operation", "source": str(source), "destination": str(canonical), "media_type": "tv", "metadata": {}, "action": "verified-existing-duplicate"},
         {"type": "final", "operations": 1},
     ]) + "\n")
+    config = trusted_legacy_config(config, report)
 
     candidates, rejected = assess_category(config, category, hash_files=False)
     assert not rejected and candidates[0].state == "CANDIDATE"
@@ -281,6 +423,7 @@ def test_v3_mixed_move_accepts_only_preserved_duplicate(tmp_path: Path):
         {"type":"final", "operations":2, "status":"completed"},
     ]
     report.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    config = trusted_legacy_config(config, report)
     items, rejected = assess_category(config, category)
     assert not rejected
     assert next(item for item in items if item.source == duplicate).state == "SAFE"
@@ -325,9 +468,11 @@ def test_kavita_v3_partial_report_accepts_only_complete_items(tmp_path: Path):
             },
         ],
     }
-    (state / "kavita-reports" / "partial.json").write_text(json.dumps(payload))
+    report = state / "kavita-reports" / "partial.json"
+    report.write_text(json.dumps(payload))
     category = Category("Books", ingest, production, "kavita")
     config = Config((category,), (), None, True, state)
+    config = trusted_legacy_config(config, report)
 
     items, rejected = assess_category(config, category)
 
@@ -564,10 +709,12 @@ def test_music_apply_chain_and_dry_run(tmp_path: Path):
     source = ingest / "album" / "track.mp3"; source.parent.mkdir(); source.write_bytes(b"music")
     destination = production / "artist" / "track.mp3"; destination.parent.mkdir(); destination.write_bytes(b"music")
     data = music_report(ingest, production, "album/track.mp3", "artist/track.mp3")
-    (state / "reports" / "music.json").write_text(json.dumps(data))
-    category = Category("Music", ingest, production, "music"); config = Config((category,), (), state, False)
+    report_path = state / "reports" / "music.json"
+    report_path.write_text(json.dumps(data))
+    category = Category("Music", ingest, production, "music")
+    config = trusted_legacy_config(Config((category,), (), state, False), report_path)
     items, bad = assess_category(config, category); assert not bad and items[0].state == "SAFE"
-    data["mode"] = "dry-run"; (state / "reports" / "music.json").write_text(json.dumps(data))
+    data["mode"] = "dry-run"; report_path.write_text(json.dumps(data))
     items, bad = assess_category(config, category); assert items[0].state == "UNKNOWN" and bad
 
 
@@ -618,9 +765,11 @@ def test_music_auxiliary_files_do_not_poison_audio_provenance(tmp_path: Path):
         if index:
             data["albums"][0]["tracks"].append({"source":source.name, "source_path":str(source), "destination":destination.name, "destination_path":str(destination), "final_destination":str(destination), "readable":True, "source_size_bytes":5, "staged_size_bytes":5, "verified_size_match":True, "publication_status":"published_or_verified_existing"})
     data["published_file_count"] = 96
-    (state / "reports" / "music.json").write_text(json.dumps(data))
+    report_path = state / "reports" / "music.json"
+    report_path.write_text(json.dumps(data))
     category = Category("Music", ingest, production, "music")
-    items, bad = assess_category(Config((category,), (), state, False), category)
+    config = trusted_legacy_config(Config((category,), (), state, False), report_path)
+    items, bad = assess_category(config, category)
     assert not bad and len(items) == 92 and {item.state for item in items} == {"SAFE"}
 def test_audit_report_is_written_under_xdg_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
@@ -643,7 +792,10 @@ def test_explain_and_provenance_status_are_read_only(tmp_path: Path, monkeypatch
 
 def _kavita_report(source: Path, destination: Path, *, transformed: bool = False) -> dict[str, object]:
     return {
-        "report_schema": "kavita-ingest-publication-v1",
+        "report_schema": "kavita-ingest-publication-v4",
+        "producer": "kavita-ingest",
+        "producer_version": "1.1.0",
+        "producer_instance_id": machine_instance_id(),
         "operation_id": "synthetic-preserve-run",
         "approved_apply": True,
         "status": "completed",
@@ -651,6 +803,10 @@ def _kavita_report(source: Path, destination: Path, *, transformed: bool = False
         "verification_completed": True,
         "recovery_required": False,
         "items": [{
+            "item_state": "complete",
+            "cleanup_eligible": True,
+            "source_lifecycle": "preserved",
+            "action": "published",
             "source": str(source),
             "destination": str(destination),
             "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
@@ -711,9 +867,11 @@ def test_kavita_v2_mixed_lifecycle_accepts_only_preserved_item(tmp_path: Path):
         digest = hashlib.sha256(source.read_bytes()).hexdigest()
         return {"source":str(source), "destination":str(destination), "source_sha256":digest, "destination_sha256":digest, "source_lifecycle":lifecycle, "action":"verified-existing-duplicate", "transformations":[]}
     report = {"report_schema":"kavita-ingest-publication-v2", "approved_apply":True, "status":"completed", "source_lifecycle":"mixed", "verification_completed":True, "recovery_required":False, "items":[item(preserved, preserved_dest, "preserved"), item(removed, removed_dest, "removed")]}
-    (state / "kavita-reports" / "run.json").write_text(json.dumps(report))
+    report_path = state / "kavita-reports" / "run.json"
+    report_path.write_text(json.dumps(report))
     category = Category("Comics", ingest, production, "kavita")
-    results, rejected = assess_category(Config((category,), (), None, True, state), category)
+    config = trusted_legacy_config(Config((category,), (), None, True, state), report_path)
+    results, rejected = assess_category(config, category)
     assert not rejected
     assert next(value for value in results if value.source == preserved).state == "BACKUP_REQUIRED"
     assert next(value for value in results if value.source == removed).state == "UNKNOWN"
@@ -736,7 +894,8 @@ def test_kavita_report_is_routed_to_one_configured_category_without_false_reject
         "source_lifecycle": "preserved", "action": "published",
         "source_root": str(books_in), "library_root": str(books_out),
     })
-    (state / "kavita-reports" / "books.json").write_text(json.dumps(report))
+    report_path = state / "kavita-reports" / "books.json"
+    report_path.write_text(json.dumps(report))
     config = Config(
         (
             Category("Books", books_in, books_out, "kavita"),
@@ -744,6 +903,7 @@ def test_kavita_report_is_routed_to_one_configured_category_without_false_reject
         ),
         (), None, True, state,
     )
+    config = trusted_legacy_config(config, report_path)
 
     results, rejected = assess(config)
 

@@ -33,3 +33,7 @@ music_root = "/home/user/.local/state/music-ingest"
 # Private exact-source proof records default to
 # $XDG_STATE_HOME/ingest-cleanup/backup-proofs.
 # backup_proof_root = "/path/to/ingest-cleanup/backup-proofs"
+# Legacy reports are rejected unless explicitly pinned to a private inventory.
+# Default: $XDG_STATE_HOME/ingest-cleanup/trusted-legacy-reports-v1.json.
+# Do not copy this inventory between machines.
+# legacy_report_inventory = "/path/to/ingest-cleanup/trusted-legacy-reports-v1.json"

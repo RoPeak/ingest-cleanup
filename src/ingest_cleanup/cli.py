@@ -22,6 +22,7 @@ from .core import (
     verify_saved_plan,
 )
 from .diagnostics import compatibility_payload
+from .legacy_inventory import create_inventory, inventory_status
 from .progress import ProgressDisplay
 from .reconciliation import ReconciliationItem, reconcile
 
@@ -32,11 +33,13 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--config-file", type=Path, default=xdg_config())
     value.add_argument("--verbose", action="store_true")
     value.add_argument("--json", action="store_true", help="emit a versioned machine-readable result")
-    value.add_argument("command", nargs="?", choices=("status", "verify", "show", "apply", "config", "help", "explain", "reconcile", "provenance-status", "compatibility", "backup-proof"), default="status")
+    value.add_argument("command", nargs="?", choices=("status", "verify", "show", "apply", "config", "help", "explain", "reconcile", "provenance-status", "compatibility", "backup-proof", "legacy-inventory"), default="status")
     value.add_argument("target", nargs="?", help="Incoming path, category name, or verification plan ID, depending on command")
     value.add_argument("--publication", type=Path, help="Published destination bound to backup proof")
     value.add_argument("--backup-object", type=Path, help="Exact source-byte object on independent storage")
     value.add_argument("--expected-uuid", help="Expected independent backup filesystem UUID")
+    value.add_argument("--report", action="append", type=Path, default=[], help="Explicit legacy report path for legacy-inventory create")
+    value.add_argument("--yes", action="store_true", help="Confirm the explicit legacy-inventory create operation")
     return value
 
 
@@ -379,6 +382,59 @@ def main(argv: list[str] | None = None) -> int:
             for schema, count in dict(observed["reports_by_schema"]).items():
                 print(f"  {count:>4}  {schema}")
             print("Use `ingest-cleanup compatibility --json` for supported schemas and rejection details.")
+        return 0
+    if args.command == "legacy-inventory":
+        action = args.target or "status"
+        if action == "status":
+            payload = {
+                "schema": "ingest-cleanup-legacy-inventory-status-v1",
+                "inventory": inventory_status(config),
+            }
+            if args.json:
+                print(json.dumps(payload, indent=2, sort_keys=True))
+            else:
+                inventory = payload["inventory"]
+                assert isinstance(inventory, dict)
+                print(f"Legacy inventory: {inventory.get('state')}")
+                print(f"Path: {inventory.get('path')}")
+                print(f"Trusted reports: {inventory.get('trusted_reports', 0)}")
+                if inventory.get("reason"):
+                    print(f"Reason: {inventory['reason']}")
+                print("Missing or invalid inventory rejects every legacy report.")
+            return 0
+        if action != "create":
+            print(
+                "ingest-cleanup legacy-inventory accepts only status or create",
+                file=sys.stderr,
+            )
+            return 2
+        if not args.report:
+            print(
+                "ingest-cleanup legacy-inventory create requires at least one --report PATH",
+                file=sys.stderr,
+            )
+            return 2
+        if not args.yes:
+            print(
+                "ingest-cleanup legacy-inventory create requires --yes after reviewing every report",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            target = create_inventory(config, list(args.report))
+        except (OSError, ValueError) as exc:
+            print(f"ingest-cleanup: legacy inventory refused: {exc}", file=sys.stderr)
+            return 2
+        payload = {
+            "schema": "ingest-cleanup-legacy-inventory-created-v1",
+            "path": str(target),
+            "inventory": inventory_status(config),
+        }
+        if args.json:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            print(f"Created trusted legacy inventory: {target}")
+            print("No media or producer report was changed.")
         return 0
     if args.command == "backup-proof":
         if not args.target or not args.publication or not args.backup_object or not args.expected_uuid:

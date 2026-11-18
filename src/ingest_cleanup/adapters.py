@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .config import Category, Config
+from .legacy_inventory import is_trusted as legacy_report_is_trusted
 from .provenance import require_local_producer
 
 
@@ -150,6 +151,15 @@ def video_records(config: Config, category: Category) -> tuple[list[Evidence], l
                 operations = rows[1:-1]
                 if rows[-1].get("operations") != len(operations) or any(not isinstance(row, dict) or row.get("type") != "operation" for row in operations):
                     raise ValueError("incomplete or invalid operation sequence")
+                if version < 4 and not legacy_report_is_trusted(
+                    config,
+                    report=report,
+                    adapter="video",
+                    schema=f"video-jsonl-v{version}",
+                    sha256=report_hash,
+                    identity=report_identity,
+                ):
+                    raise ValueError("legacy report is not in the trusted inventory")
                 for index, row in enumerate(operations, 1):
                     source, destination = _absolute_clean(row.get("source")), _absolute_clean(row.get("destination"))
                     if source is None or destination is None:
@@ -228,6 +238,15 @@ def music_records(config: Config, category: Category) -> tuple[list[Evidence], l
                 raise ValueError("not an approved preserved APPLY publication")
             if data.get("publication_completed") is not True:
                 raise ValueError("publication did not complete")
+            if schema in {"music-ingest-publication-v1", "music-ingest-publication-v2"} and not legacy_report_is_trusted(
+                config,
+                report=report,
+                adapter="music",
+                schema=str(schema),
+                sha256=report_hash,
+                identity=report_identity,
+            ):
+                raise ValueError("legacy report is not in the trusted inventory")
             source_root = _absolute_clean(data.get("source_root"))
             library_root = _absolute_clean(data.get("library_root"))
             if source_root is None or library_root is None or source_root != category.ingest_root or library_root != category.production_root:
@@ -341,6 +360,19 @@ def kavita_records(config: Config, category: Category) -> tuple[list[Evidence], 
             )
             if not (data.get("status") in accepted_statuses and recovery_consistent and data.get("approved_apply") is True and data.get("source_lifecycle") in accepted_lifecycle and data.get("verification_completed") is True):
                 raise ValueError("not a completed verified preserve-source APPLY")
+            if schema in {
+                "kavita-ingest-publication-v1",
+                "kavita-ingest-publication-v2",
+                "kavita-ingest-publication-v3",
+            } and not legacy_report_is_trusted(
+                config,
+                report=report,
+                adapter="kavita",
+                schema=str(schema),
+                sha256=report_hash,
+                identity=report_identity,
+            ):
+                raise ValueError("legacy report is not in the trusted inventory")
             for index, item in enumerate(data.get("items", []), 1):
                 if not isinstance(item, dict): raise ValueError("invalid item")
                 source = _absolute_clean(item.get("source"))
